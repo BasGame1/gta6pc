@@ -23,6 +23,7 @@
   <a href="#credits">Credits</a> |
   <a href="#license">License</a> |
   <a href="docs/status.md">Status</a> |
+  <a href="docs/objectives.md">Objectives</a> |
   <a href="https://t.me/PixelifyNext">Telegram</a>
 </p>
 
