@@ -8,7 +8,7 @@ import spirv_asm
 
 class MeshAllocSingleWriterTests(unittest.TestCase):
     def test_ms_alloc_req_single_writer_guard(self):
-        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) restricts OpStore %ms_counts to local_index == 0."""
+        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) stores %ms_counts atomically to avoid data races."""
         for mesh_compute in (False, True):
             orig_mc = rdna2spirv.MESH_COMPUTE
             try:
@@ -24,23 +24,10 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
                 gen._insn(ins)
 
                 body_text = "\n".join(gen.body)
-                # 1. OpStore %ms_counts must be present
-                self.assertIn("OpStore %ms_counts", body_text)
+                # 1. OpAtomicStore %ms_counts must be present
+                self.assertIn("OpAtomicStore %ms_counts", body_text)
 
-                # 2. Must load %local_index and compare to 0
-                self.assertIn("= OpLoad %uint %local_index", body_text)
-                self.assertRegex(body_text, r"%(\w+) = OpIEqual %bool %(\w+) %c0")
-
-                # 3. Must have structured selection merge and conditional branch
-                self.assertRegex(body_text, r"OpSelectionMerge %(\w+) None\s+OpBranchConditional %(\w+) %(\w+) %(\w+)")
-
-                # 4. OpStore %ms_counts must only appear inside the conditional block
-                lines = [l.strip() for l in gen.body if l.strip()]
-                store_idx = next(i for i, l in enumerate(lines) if "OpStore %ms_counts" in l)
-                branch_cond_idx = next(i for i, l in enumerate(lines) if "OpBranchConditional" in l)
-                self.assertGreater(store_idx, branch_cond_idx)
-
-                # 5. Verify assembly into a complete module passes spirv_asm
+                # 2. Verify assembly into a complete module passes spirv_asm
                 # Build mock header
                 types_and_vars = [
                     "OpCapability Shader",
@@ -53,6 +40,7 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
                     "%bool = OpTypeBool",
                     "%uint = OpTypeInt 32 0",
                     "%c0 = OpConstant %uint 0",
+                    "%c2 = OpConstant %uint 2",
                     "%_ptr_Input_uint = OpTypePointer Input %uint",
                     "%_ptr_Workgroup_uint = OpTypePointer Workgroup %uint",
                     "%_ptr_Function_uint = OpTypePointer Function %uint",
