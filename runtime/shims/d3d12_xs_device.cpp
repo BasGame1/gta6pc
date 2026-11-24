@@ -44,7 +44,7 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
+constexpr unsigned kMaxSlots = 192;
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
@@ -128,6 +128,7 @@ const char* slot_name(unsigned slot) {
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
+        case 26: return "GetCustomHeapProperties (Xbox struct-return ABI)";
         case 27: return "CreateCommittedResource (PC slot 27)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
@@ -147,6 +148,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 133: return "Xbox CreatePlacedResourceX";
         default: return "forwarded";
     }
 }
@@ -1480,6 +1482,45 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Xbox device slot 133: CreatePlacedResourceX(va, desc, state, clear, riid, out).
+// The shape matches the console placed resource creation. A committed DEFAULT-heap buffer is created from desc
+// with Flags restricted to valid PC flags, mapping state 0xFFFFFFFF to D3D12_RESOURCE_STATE_COMMON.
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* desc,
+                                       std::uint32_t state, const D3D12_CLEAR_VALUE* clear,
+                                       const IID* riid, void** out) {
+    note_slot(133);
+    if (out) *out = nullptr;
+    if (!desc || !riid || !out) return E_POINTER;
+
+    D3D12_RESOURCE_DESC pc_desc = *desc;
+    constexpr D3D12_RESOURCE_FLAGS kPcFlags =
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+        D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(pc_desc.Flags & kPcFlags);
+
+    const D3D12_RESOURCE_STATES pc_state = (state == 0xFFFFFFFF) ? D3D12_RESOURCE_STATE_COMMON
+                                                                 : static_cast<D3D12_RESOURCE_STATES>(state);
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX(va 0x%llx, size %llu, flags 0x%x) -> committed buffer\n",
+                     static_cast<unsigned long long>(va), static_cast<unsigned long long>(desc->Width),
+                     static_cast<unsigned>(desc->Flags));
+    }
+
+    return self->real->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &pc_desc,
+                                               pc_state, clear, *riid, out);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1506,6 +1547,26 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 26) {
+        // Struct-returning method: GetCustomHeapProperties returns D3D12_HEAP_PROPERTIES.
+        // PC MSVC expects (this, return_buffer, node_mask, heap_type).
+        // Xbox caller passes (return_buffer, this, node_mask, heap_type).
+        DeviceProxy* dev = self;
+        void* ret_buf = reinterpret_cast<void*>(a1);
+        std::uint32_t node_mask = static_cast<std::uint32_t>(a2);
+        D3D12_HEAP_TYPE heap_type = static_cast<D3D12_HEAP_TYPE>(a3);
+        if (a1 && reinterpret_cast<DeviceProxy*>(a1)->real) {
+            dev = reinterpret_cast<DeviceProxy*>(a1);
+            ret_buf = reinterpret_cast<void*>(self);
+            node_mask = static_cast<std::uint32_t>(a2);
+            heap_type = static_cast<D3D12_HEAP_TYPE>(a3);
+        }
+        note_slot(26);
+        const D3D12_HEAP_PROPERTIES props = dev->real->GetCustomHeapProperties(node_mask, heap_type);
+        if (ret_buf) {
+            *reinterpret_cast<D3D12_HEAP_PROPERTIES*>(ret_buf) = props;
+        }
+        return reinterpret_cast<std::uint64_t>(ret_buf);
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                                      reinterpret_cast<void**>(a4)));
@@ -1529,6 +1590,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_placed_resource_x(
+            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
+            static_cast<std::uint32_t>(a3), reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4),
+            reinterpret_cast<const IID*>(a5), reinterpret_cast<void**>(a6)));
     } else {
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
@@ -1704,9 +1770,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
+        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+        slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

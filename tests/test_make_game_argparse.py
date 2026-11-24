@@ -280,6 +280,14 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                             mock_preflight.assert_not_called()
                             mock_shaders.assert_not_called()
 
+    def test_skip_check_flag_passed_to_check(self):
+        with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir, "--skip-check", "--check"]):
+            with patch("make_game.below_normal"):
+                with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}) as mock_check:
+                    ret = make_game.main()
+                    self.assertEqual(ret, 0)
+                    mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False, allow_missing=True)
+
     def test_find_flag_exits_early_without_running_check_or_stages(self):
         with patch.object(sys, "argv", ["make_game.py", "--find"]):
             with patch("make_game.below_normal"):

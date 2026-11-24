@@ -1053,7 +1053,7 @@ def ensure_submodule() -> None:
          "\"git submodule update --init --recursive\" in this folder and build again.")
 
 
-def check(game: str, full: bool) -> dict:
+def check(game: str, full: bool, allow_missing: bool = False) -> dict:
     if not os.path.isdir(game):
         h = xvd_header(game) if os.path.isfile(game) else None
         fail(container_message(game, h) if h else f"Game folder not found: {game}")
@@ -1067,11 +1067,17 @@ def check(game: str, full: bool) -> dict:
         elif os.path.getsize(p) != info["size"]:
             print(f"  wrong size  {rel}"); bad += 1
     if bad:
-        fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
-    if full:
+        msg = f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}."
+        if allow_missing:
+            log(f"check: WARNING: {msg} Continuing because --skip-check was requested.")
+        else:
+            fail(msg)
+    if full and not (bad and allow_missing):
         py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     exe = os.path.join(game, v["expected_exe"])
-    log(f"check: all files present{' and hashes match' if full else ''}. "
+    status_str = "all files present" if not bad else f"{len(v['files']) - bad}/{len(v['files'])} files present"
+    log(f"check: {status_str}"
+        + f"{' and hashes match' if full and not bad else ''}. "
         + ("Executable found." if os.path.isfile(exe) else
            f"{v['expected_exe']} is not in the folder: the runtime stage can be built but not run."))
     return v
@@ -2675,6 +2681,9 @@ def main() -> int:
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
+    ap.add_argument("--skip-check", action="store_true",
+                    help="warn instead of failing when files from the manifest are missing (useful for testing "
+                         "stages on partial downloads)")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
@@ -2743,7 +2752,7 @@ def main() -> int:
     work = os.path.abspath(a.work or os.path.join(out, "work"))
     require_folder("--out", out)
     require_folder("--work", work)
-    v = check(game, a.full_check)
+    v = check(game, a.full_check, allow_missing=True) if getattr(a, "skip_check", False) else check(game, a.full_check)
     if a.check:
         return 0
     # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
