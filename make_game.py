@@ -2255,7 +2255,7 @@ def cross_build_runtime(jobs: int) -> str:
 def build_pipeline_check(jobs: int) -> None:
     build = os.path.join(ROOT, "runtime", "build", "linux")
     log("pipelines: building vk_pipeline_check")
-    cmake_configure(build)
+    cmake_configure(build, "-DLEONIDA_VULKAN_HEADERS_FETCH=ON")
     cmake_build(build, ["vk_pipeline_check"], jobs,
                 "It needs a C++20 compiler and the Vulkan headers (your distribution's Vulkan headers package, "
                 "or VULKAN_SDK); the CMake output above says which is missing.")
