@@ -22,6 +22,9 @@
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
@@ -69,6 +72,7 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
     std::atomic<std::uint64_t> frame_next_token{1};
+    std::atomic<std::uint64_t> last_placed_va{0};
 };
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
@@ -79,6 +83,8 @@ struct HeapProxy {
     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
     void** real_vtable;
     std::atomic<unsigned long> refs;
+    std::uint64_t custom_cpu_start = 0;
+    std::uint64_t custom_gpu_start = 0;
 };
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -526,6 +532,9 @@ HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
 // returns in RAX also works. The extra register is harmless when the callee ignores it.
 D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
     note_heap_slot(9);
+    if (self->custom_cpu_start != 0) {
+        return D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(self->custom_cpu_start)};
+    }
     constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
@@ -537,6 +546,9 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
     note_heap_slot(10);
+    if (self->custom_gpu_start != 0) {
+        return D3D12_GPU_DESCRIPTOR_HANDLE{self->custom_gpu_start};
+    }
     constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
     D3D12_GPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
@@ -590,7 +602,8 @@ void** get_heap_vtable() {
     return vtable;
 }
 
-HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out) {
+HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
+                          std::uint64_t custom_cpu_start = 0, std::uint64_t custom_gpu_start = 0) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -602,6 +615,8 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->device = device;
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->refs.store(1, std::memory_order_relaxed);
+    proxy->custom_cpu_start = custom_cpu_start;
+    proxy->custom_gpu_start = custom_gpu_start;
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
 
     const HRESULT hr = heap_query_interface(proxy, &riid, out);
@@ -1341,15 +1356,45 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     note_slot(14);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
     if (!riid) return E_POINTER;
+    if (!desc) return E_INVALIDARG;
+
+    // Mask flags to standard PC flags for the real PC device to avoid rejection of console flags
+    D3D12_DESCRIPTOR_HEAP_DESC pc_desc = *desc;
+    pc_desc.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(pc_desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+
+    // Check for custom base address:
+    // 1. Extended desc word at +16 (if non-zero)
+    // 2. LEONIDA_HEAP_START_VA env var
+    // 3. Fallback to last placed resource VA (slot 133)
+    std::uint64_t custom_address = 0;
+    const auto* words = reinterpret_cast<const std::uint32_t*>(desc);
+    const std::uint64_t extra_addr = *reinterpret_cast<const std::uint64_t*>(words + 4);
+    if (extra_addr != 0) {
+        custom_address = extra_addr;
+        std::fprintf(stderr, "[rt] d3d12_xs: CreateDescriptorHeap extended address 0x%llx\n",
+                     static_cast<unsigned long long>(custom_address));
+    } else {
+#pragma warning(suppress : 4996)
+        if (const char* env_va = std::getenv("LEONIDA_HEAP_START_VA")) {
+            custom_address = std::strtoull(env_va, nullptr, 0);
+            std::fprintf(stderr, "[rt] d3d12_xs: CreateDescriptorHeap LEONIDA_HEAP_START_VA 0x%llx\n",
+                         static_cast<unsigned long long>(custom_address));
+        } else if (self->last_placed_va.load(std::memory_order_relaxed) != 0) {
+            custom_address = self->last_placed_va.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[rt] d3d12_xs: CreateDescriptorHeap inheriting slot 133 placed VA 0x%llx\n",
+                         static_cast<unsigned long long>(custom_address));
+        }
+    }
+
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
-    if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
+    if (!out) return self->real->CreateDescriptorHeap(&pc_desc, *riid, nullptr);
 
     void* created = nullptr;
-    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    HRESULT hr = self->real->CreateDescriptorHeap(&pc_desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
-    hr = create_heap_proxy(heap, self, *riid, out);
+    hr = create_heap_proxy(heap, self, *riid, out, custom_address, custom_address);
     if (FAILED(hr)) heap->Release();
     return hr;
 }
@@ -1491,6 +1536,8 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
     note_slot(133);
     if (out) *out = nullptr;
     if (!desc || !riid || !out) return E_POINTER;
+
+    self->last_placed_va.store(va, std::memory_order_relaxed);
 
     D3D12_RESOURCE_DESC pc_desc = *desc;
     constexpr D3D12_RESOURCE_FLAGS kPcFlags =

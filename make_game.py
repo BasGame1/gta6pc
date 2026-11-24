@@ -2722,10 +2722,23 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--compat-all", "--universal-gpu", dest="compat_all", action="store_true",
+                    help="enable all emulation and fallback passes (--wave64-emulate on, --mesh-compute, "
+                         "--pc-tail-ubo, --bary-fallback, --f16-interp-fallback, --texel-offset-fallback, "
+                         "--no-float-controls) for universal compatibility across all NVIDIA, AMD, Intel, "
+                         "and integrated GPUs (iGPUs)")
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
     a = ap.parse_args()
+    if a.compat_all:
+        a.wave64_emulate = "on"
+        a.mesh_compute = True
+        a.pc_tail_ubo = True
+        a.bary_fallback = True
+        a.f16_interp_fallback = True
+        a.texel_offset_fallback = True
+        a.no_float_controls = True
     stages = STAGES
     if a.stages is not None:
         stages = [s.strip() for s in a.stages.split(",") if s.strip()]

@@ -288,6 +288,58 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                     self.assertEqual(ret, 0)
                     mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False, allow_missing=True)
 
+    def test_compat_all_enables_all_fallback_flags(self):
+        with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir, "--compat-all", "--check"]):
+            with patch("make_game.below_normal"):
+                with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
+                    orig_parse_args = argparse.ArgumentParser.parse_args
+                    captured = []
+
+                    def wrap_parse(parser_self, *args, **kwargs):
+                        res = orig_parse_args(parser_self, *args, **kwargs)
+                        captured.append(res)
+                        return res
+
+                    with patch.object(argparse.ArgumentParser, "parse_args", wrap_parse):
+                        ret = make_game.main()
+                        self.assertEqual(ret, 0)
+                        self.assertEqual(len(captured), 1)
+                        a = captured[0]
+                        self.assertTrue(a.compat_all)
+                        self.assertEqual(a.wave64_emulate, "on")
+                        self.assertTrue(a.mesh_compute)
+                        self.assertTrue(a.pc_tail_ubo)
+                        self.assertTrue(a.bary_fallback)
+                        self.assertTrue(a.f16_interp_fallback)
+                        self.assertTrue(a.texel_offset_fallback)
+                        self.assertTrue(a.no_float_controls)
+
+    def test_universal_gpu_alias_enables_all_fallback_flags(self):
+        with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir, "--universal-gpu", "--check"]):
+            with patch("make_game.below_normal"):
+                with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
+                    orig_parse_args = argparse.ArgumentParser.parse_args
+                    captured = []
+
+                    def wrap_parse(parser_self, *args, **kwargs):
+                        res = orig_parse_args(parser_self, *args, **kwargs)
+                        captured.append(res)
+                        return res
+
+                    with patch.object(argparse.ArgumentParser, "parse_args", wrap_parse):
+                        ret = make_game.main()
+                        self.assertEqual(ret, 0)
+                        self.assertEqual(len(captured), 1)
+                        a = captured[0]
+                        self.assertTrue(a.compat_all)
+                        self.assertEqual(a.wave64_emulate, "on")
+                        self.assertTrue(a.mesh_compute)
+                        self.assertTrue(a.pc_tail_ubo)
+                        self.assertTrue(a.bary_fallback)
+                        self.assertTrue(a.f16_interp_fallback)
+                        self.assertTrue(a.texel_offset_fallback)
+                        self.assertTrue(a.no_float_controls)
+
     def test_find_flag_exits_early_without_running_check_or_stages(self):
         with patch.object(sys, "argv", ["make_game.py", "--find"]):
             with patch("make_game.below_normal"):
