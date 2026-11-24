@@ -12,7 +12,7 @@
   ![xbox](https://www.readmecodegen.com/api/social-icon?name=xbox&size=32)
   ![rockstargames](https://www.readmecodegen.com/api/social-icon?name=rockstargames&size=32)
 </h2>
-<h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows or Linux, built on your PC from your own copy.
+<h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows or Linux, built on your PC from your own copy, forked from the original Leonida by NotRexed
 </h4>
 
 <p align="center">
