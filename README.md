@@ -1,12 +1,8 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/leonida.png" alt="Leonida" width="200">
+  <img src="assets/leonida.png" alt="Leonida" width="500">
 </a>
-
-  <br>
-  <b>Leonida</b>
-  <br>
 </h1>
 <h2 align="center"> <br>
   
