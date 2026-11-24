@@ -66,10 +66,10 @@ open pull request for it.
 ## What the executable already does about a failure
 
 Four of the calls above have a branch for a negative result: `AcpHalCreate`, `AcpHalAllocateShapeContexts`,
-`ApuCreateHeap` and `XApuDequeueResult`. An unimplemented import under `LEONIDA_UNIMPLEMENTED=log` returns 0, so a caller
-that tests for a negative result sees success with its outputs unset; under `fail` only imports `classify_import`
-knows to return an `HRESULT` get `E_NOTIMPL`, and none of these four is on that list (it names only functions the public
-documentation describes). So today neither mode makes the executable take its own failure path for the audio hardware.
+`ApuCreateHeap` and `XApuDequeueResult`. `runtime/shims/audio_hal.cpp` implements shims for all 19 audio functions
+and DirectStorage `DStorageGetFactory`: out parameters are zeroed and negative error codes (`E_NOTIMPL`) or clean
+non-zero status codes are returned to trigger the executable's graceful failure paths and fallback to software
+audio mixing on PC; `audio_hal_test` verifies this behaviour across all entry points.
 Whether the title survives that path, or needs the coprocessor, is **unmeasured**: it takes a run to find out, and the
 first run reported in #6603 stops earlier, in `D3D12ConfigureVirtualMemoryX`.
 

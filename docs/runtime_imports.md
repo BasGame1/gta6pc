@@ -171,11 +171,11 @@ index and caller once and returns `E_NOTIMPL` without writing its arguments. The
 the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
 The table above was measured before this shim and still lists these two as unimplemented; they are served now.
 
-Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
-they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
-`xapu.dll`, `AcpHal.dll`) with no shim at all.
-
-The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+The seven `xmem.dll` imports and `D3D12ConfigureVirtualMemoryX` are served by `xmem.cpp` and `d3d12_xs.cpp`.
+The remaining 22 imports across `xg_xs.dll` (`xg_xs.cpp`), `XCRDAPI.dll`, `chad.dll`, `xapu.dll`, and `AcpHal.dll`
+(`audio_hal.cpp`) are now served with clean fallbacks and zeroed out-pointers matching the measured call shapes;
+`xg_xs_test` and `audio_hal_test` cover them. All 30 previously unimplemented imports on `game_scarlett_master.exe`
+are now handled.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and

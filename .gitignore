@@ -37,3 +37,4 @@ __pycache__/
 *.exp
 *.log
 .vs/
+.xwin-cache/
