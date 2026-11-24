@@ -122,4 +122,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     raise SystemExit(main())

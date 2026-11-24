@@ -311,6 +311,8 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             return op
 
         def norm_arg(a, op=""):
+            if op == "exp" and a.get("t") == "null":
+                return ("target", "null", False, False)
             k = a["k"]
             if k in ("vgpr", "sgpr"):
                 return (k, a["r"], a.get("n", 1), bool(a.get("neg")), bool(a.get("abs")), bool(a.get("sext")))

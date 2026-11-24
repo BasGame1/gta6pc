@@ -287,7 +287,14 @@ class BadCarveIndexTest(unittest.TestCase):
 
     def test_missing_file_names_what_is_wrong(self):
         folder = self.make_folder()
-        self.assert_one_error(self.run_tool(os.path.join(folder, "nope.rpf")), "nope.rpf", "no such file or folder")
+        res = self.run_tool(os.path.join(folder, "nope.rpf"))
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        lines = res.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, res.stderr)
+        self.assertTrue(lines[0].startswith("ERROR:"), lines[0])
+        self.assertIn("nope.rpf", lines[0])
+        self.assertIn("no such file or folder", lines[0])
 
     def test_reads_carve_index_with_utf8_bom(self):
         folder = tempfile.mkdtemp()

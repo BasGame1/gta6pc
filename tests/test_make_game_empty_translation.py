@@ -36,6 +36,12 @@ class Done:
     def kill(self):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
 
 class TranslateEmptyIndexTest(unittest.TestCase):
     """translate(): a merge that published nothing is an error and must not leave a marker behind."""
@@ -102,6 +108,9 @@ class TranslateLockedIndexTest(unittest.TestCase):
             return real_open(path, mode, *a, **k)
 
         class Exited(Done):
+            def poll(self):
+                return shard_code
+
             def wait(self):
                 return shard_code
 

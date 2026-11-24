@@ -22,7 +22,7 @@
   <a href="#want-to-help">Want to help?</a> |
   <a href="#credits">Credits</a> |
   <a href="#license">License</a> |
-  <a href="#status">Status</a> |
+  <a href="docs/status.md">Status</a> |
   <a href="https://t.me/PixelifyNext">Telegram</a>
 </p>
 

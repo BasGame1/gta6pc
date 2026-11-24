@@ -134,7 +134,8 @@ it, writes that index into the image's `AddressOfIndex`, and copies the image's 
 slot. This reserves one index; every additional simultaneous TLS module gets its own by mapping a fresh
 clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16 modules can be live at
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
-directory (or with an all-zero one) load normally.
+directory (or with an all-zero one) load normally. When an EXE reads its TLS at index 0 directly (`/GA`),
+the loader patches those accesses to an allocated slot unless disabled with `LEONIDA_TLS_GA_PATCH=0`.
 
 Current limits, by design:
 
@@ -462,6 +463,8 @@ dimension outside the enum must be refused alike. It also copies a pattern throu
 ```powershell
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_placed_dimensions_test.exe
+```
+
 ### 1D render targets and depth buffers
 
 `d3d12_texture1d_target_test` creates `TEXTURE1D` textures with `ALLOW_RENDER_TARGET` (10 color formats) or
