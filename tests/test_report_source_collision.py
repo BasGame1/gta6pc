@@ -19,8 +19,15 @@ TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR", os.path.join(ROOT, "tools"))
 SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
-def make_bink():
-    return SENTINEL
+def make_bink(revision="n", frames=4, width=320, height=240, audio=0, body=256,
+              fps_num=30, fps_den=1):
+    extra = b"\x00\x05\xe9\x87" if revision in "ijkn" else b""
+    total = 0x2C + len(extra) + 4 * frames + body
+    header = bytearray(0x2C)
+    header[0:4] = b"KB2" + revision.encode()
+    struct.pack_into("<10I", header, 4, total - 8, frames, body, frames,
+                     width, height, fps_num, fps_den, 0x40013, audio)
+    return bytes(header) + extra + bytes(4 * frames) + bytes(body)
 
 
 def make_rpf(payload, head_size=0x40):
