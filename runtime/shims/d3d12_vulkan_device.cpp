@@ -6241,7 +6241,7 @@ public:
             const char* value = std::getenv("LEONIDA_TITLE_IMAGE_STAGING");
             return !value || std::strcmp(value, "0");
         }();
-        // Keep placed movie planes with a known linear CPU layout on the host-copy path.
+        // Keep placed movie planes with a known linear CPU layout on the host-copy path, where there is one.
         // Map on a staged placement still returns the title's pages and participates in the refresh.
         std::uint32_t xg_layout = 0;
         const bool linear_placement = origin == TitleImageOrigin::placed &&
@@ -6263,17 +6263,24 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
-        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary && !linear_placement &&
-            host_transfer_ && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && device_.image_requirements) {
+        // A device without host copies has no other way to fill a title image: a refresh before a submission may not
+        // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
+        const bool no_host_copy = !device_.copy_memory_to_image && cpu_visible() && samples == 1 &&
+                                  !format.d24_as_float && !format.rgb96;
+        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary &&
+            (no_host_copy || (!linear_placement && host_transfer_)) && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+            device_.image_requirements) {
             for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
                 const auto flags = device_.memory.memoryTypes[i].propertyFlags;
                 if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
             }
+            if (no_host_copy) plain_bits = UINT32_MAX;  // nothing to compare with: any memory type will do
             VkMemoryRequirements with{}, without{};
             auto staged = info;
             staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-            if (plain_bits && device_.memory_requirements(info, with) && !(with.memoryTypeBits & plain_bits) &&
+            if (plain_bits && (no_host_copy || (device_.memory_requirements(info, with) &&
+                                                !(with.memoryTypeBits & plain_bits))) &&
                 device_.memory_requirements(staged, without) && (without.memoryTypeBits & plain_bits)) {
                 staged_title_ = true;
                 host_transfer_ = false;

@@ -2893,7 +2893,10 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   host-visible memory type. The runtime queries the same image with and without host-transfer usage.
   When only the latter permits plain device-local backing, it detiles the complete image into a reusable
   staging buffer and transfers all its mips and layers together. Linear slot-133 placements retain host
-  copies. An allocation failure retries the original host-copyable image. `LEONIDA_TITLE_IMAGE_STAGING=0`
+  copies. On a device without `VK_EXT_host_image_copy` every colour title image, linear placements too, takes the
+  staged upload: the refresh before a submission has no other way to fill one, and without it the title's textures
+  stayed zero (a flat green intro movie). An allocation failure retries the original host-copyable image.
+  `LEONIDA_TITLE_IMAGE_STAGING=0`
   restores the original placement policy. With `LEONIDA_MEM_PROBE`, each title image class logs its
   Vulkan memory type mask, mask without host transfer, and selected type.
 - `WriteToSubresource`/`ReadFromSubresource` (implemented in `d3d12_vulkan_device.cpp`) complete before they
