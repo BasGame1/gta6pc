@@ -80,9 +80,17 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
 // XMemAlloc forwards to. The measured title reaches each through one wrapper that is a bare tail jump to the import,
 // so they take exactly XMemAlloc's and XMemFree's arguments. They share the heap: a block from either allocator may be
 // released by either free.
+thread_local uint64_t t_default_seq = 0;
+thread_local void* t_default_ptr = nullptr;
+thread_local size_t t_default_size = 0;
+
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
     note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    void* p = allocate_block(size);
+    ++t_default_seq;
+    t_default_ptr = p;
+    t_default_size = size;
+    return p;
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
@@ -292,11 +300,23 @@ const Window* find_window(uintptr_t address, uint64_t bytes) {
 bool isolate_placeholder(void* address, SIZE_T size) {
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_RESERVE) {
+        std::fprintf(stderr, "[rt] xmem: isolate_placeholder VirtualQuery(%p, 0x%zx) state=0x%lx alloc=%p base=%p rsz=0x%zx\n",
+                     address, static_cast<size_t>(size), info.State, info.AllocationBase, info.BaseAddress,
+                     static_cast<size_t>(info.RegionSize));
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
     }
-    if (info.AllocationBase == address && info.RegionSize == size) return true;
-    return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+    // When a placeholder has already been split, VirtualQuery reports its sub-range in BaseAddress (AllocationBase
+    // remains the parent reservation base for slices 2..N); re-splitting an exact placeholder fails with
+    // ERROR_INVALID_PARAMETER.
+    if (info.BaseAddress == address && info.RegionSize == size) return true;
+    const BOOL ok = VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (!ok) {
+        std::fprintf(stderr, "[rt] xmem: isolate_placeholder VirtualFree(%p, 0x%zx) err=%lu base=%p alloc=%p rsz=0x%zx\n",
+                     address, static_cast<size_t>(size), GetLastError(), info.BaseAddress, info.AllocationBase,
+                     static_cast<size_t>(info.RegionSize));
+    }
+    return ok != FALSE;
 }
 
 PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
@@ -452,15 +472,21 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
                                                    it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
                                                    protect, nullptr, 0);
-    if (!view) return false;
+    if (!view) {
+        std::fprintf(stderr, "[rt] xmem: MapViewOfFile3(%p, prot=0x%lx) failed err=%lu\n", target, protect,
+                     GetLastError());
+        return false;
+    }
     g_mapped[address] = page;
     return true;
 }
 
-// Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
-// GPU memory, which the D3D12 layer reads on the CPU.
+// Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike, and three carry
+// PAGE_WRITECOMBINE (0x400); MapViewOfFile3 rejects both NOACCESS and cache modifiers on section views, so map
+// windows read-write with modifiers stripped.
 DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+    const DWORD base = window.protect & 0xFFu;
+    return (!base || base == PAGE_NOACCESS) ? PAGE_READWRITE : base;
 }
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
@@ -726,3 +752,11 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages)},
     {"xmem.dll", "XMemMapPhysicalPagesScatter", reinterpret_cast<void*>(&XMemMapPhysicalPagesScatter)},
 );
+
+namespace rt::shims::xmem {
+void last_default_alloc(uint64_t& seq, void*& ptr, size_t& size) {
+    seq = t_default_seq;
+    ptr = t_default_ptr;
+    size = t_default_size;
+}
+}  // namespace rt::shims::xmem

@@ -472,6 +472,28 @@ void test_placeholders(const PhysicalApi& api) {
     check(api.map(window, 2, nullptr) == window, "unmap the carved window");
     check(api.free_pages(2, pages) == TRUE, "free the carved window's pages");
     check(reserved_only(base), "the rest of the placeholder is still reserved");
+
+    // Pre-split slice (BaseAddress != AllocationBase) with PAGE_WRITECOMBINE (0x400) maps cleanly.
+    auto* const base2 = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
+    check(base2 != nullptr, "reserve second placeholder for pre-split test");
+    if (!base2) return;
+    check(VirtualFree(base2 + kPage64k, 2 * kPage64k, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE,
+          "pre-split placeholder slice succeeds");
+    void* const wc_window = api.virtual_alloc(base2 + kPage64k, 2 * kPage64k,
+                                              MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27,
+                                              PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_GRAPHICS_READWRITE);
+    check(wc_window == base2 + kPage64k, "pre-split PAGE_WRITECOMBINE MEM_REPLACE_PLACEHOLDER succeeds");
+    uint64_t wc_page = 0;
+    count = 1;
+    check(api.allocate(0x280, &count, &wc_page) == TRUE && count == 1, "allocate page for PAGE_WRITECOMBINE window");
+    check(api.map(wc_window, 1, &wc_page) == wc_window, "PAGE_WRITECOMBINE window maps cleanly");
+    if (wc_window) {
+        fill_page(wc_window, 0xdef0000u);
+        check(page_holds(wc_window, 0xdef0000u), "PAGE_WRITECOMBINE mapped page holds data");
+    }
+    check(api.map(wc_window, 1, nullptr) == wc_window, "unmap PAGE_WRITECOMBINE window");
+    check(api.free_pages(1, &wc_page) == TRUE, "free PAGE_WRITECOMBINE window page");
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.

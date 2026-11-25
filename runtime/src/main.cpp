@@ -33,6 +33,7 @@
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
+#include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
@@ -55,6 +56,32 @@ int usage() {
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
                  "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
+}
+
+struct XMemAllocationHooksTable {
+    void*(__stdcall* alloc)(std::size_t size, std::uint64_t attributes);
+    void(__stdcall* free)(void* ptr, std::uint64_t attributes);
+};
+
+const XMemAllocationHooksTable* g_xmem_allocation_hooks = nullptr;
+
+void notify_xmem_graphics_alloc(std::size_t bytes) {
+    if (!g_xmem_allocation_hooks || !g_xmem_allocation_hooks->alloc || bytes == 0) return;
+    std::uint64_t seq0 = 0, seq1 = 0;
+    void* ptr0 = nullptr;
+    void* ptr1 = nullptr;
+    std::size_t sz0 = 0, sz1 = 0;
+    rt::shims::xmem::last_default_alloc(seq0, ptr0, sz0);
+    constexpr std::uint64_t kGraphicsAllocAttrs = (0x80ULL << 16) | 0x8000ULL;
+    void* p = g_xmem_allocation_hooks->alloc(bytes, kGraphicsAllocAttrs);
+    rt::shims::xmem::last_default_alloc(seq1, ptr1, sz1);
+    const bool passthrough = p && g_xmem_allocation_hooks->free && seq1 == seq0 + 1 && ptr1 == p && sz1 == bytes;
+    if (passthrough) g_xmem_allocation_hooks->free(p, kGraphicsAllocAttrs);
+    static int logged_count = 0;
+    if (logged_count < 4) {
+        ++logged_count;
+        std::fprintf(stderr, "[rt] xmem: graphics alloc(%zu) -> %p passthrough=%d\n", bytes, p, passthrough ? 1 : 0);
+    }
 }
 
 }  // namespace
@@ -181,6 +208,11 @@ int wmain(int argc, wchar_t** argv) {
                              r.error);
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
+        if (auto it = main_module.exports.find("__XMemAllocationHooks__");
+            it != main_module.exports.end() && it->second) {
+            g_xmem_allocation_hooks = static_cast<const XMemAllocationHooksTable*>(it->second);
+            rt::d3d12_xs::set_graphics_alloc_notifier(&notify_xmem_graphics_alloc);
+        }
         if (init || run) rt::cpu_emu::install();
         std::exception_ptr init_failure;
         if (init || run) {

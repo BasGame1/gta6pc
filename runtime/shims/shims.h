@@ -92,6 +92,10 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name);
 // Prints every unimplemented import that has been called.
 void report_called_unimplemented();
 
+namespace xmem {
+void last_default_alloc(uint64_t& seq, void*& ptr, size_t& size);
+}  // namespace xmem
+
 }  // namespace rt::shims
 
 #define SHIM_TABLE(id, ...)                                                       \

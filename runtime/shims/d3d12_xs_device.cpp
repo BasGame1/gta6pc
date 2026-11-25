@@ -40,9 +40,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <mutex>
 #include <new>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace rt::d3d12_xs {
 namespace {
@@ -53,6 +55,12 @@ static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
 static_assert(sizeof(D3D12_RESOURCE_DESC) == 56, "the measured Xbox description prefix is 56 bytes");
+
+struct PlacedResourceEntry {
+    std::uint64_t va;
+    std::uint64_t size;
+    ID3D12Resource* resource;
+};
 
 struct DeviceProxy {
     void** vtable;          // offset 0: the caller's ID3D12Device* points here
@@ -73,6 +81,9 @@ struct DeviceProxy {
     std::atomic<bool> frame_event_scheduled{false};
     std::atomic<std::uint64_t> frame_next_token{1};
     std::atomic<std::uint64_t> last_placed_va{0};
+    std::mutex placed_srv_mu;
+    std::vector<ID3D12Resource*> placed_srv_resources;
+    std::vector<PlacedResourceEntry> placed_resources;
 };
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
@@ -154,6 +165,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 127: return "Xbox CreateCommittedResource3";
         case 133: return "Xbox CreatePlacedResourceX";
         default: return "forwarded";
     }
@@ -280,6 +292,10 @@ unsigned long proxy_release(DeviceProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
         ID3D12Device* real = self->real;
+        for (ID3D12Resource* r : self->placed_srv_resources)
+            if (r) r->Release();
+        for (const PlacedResourceEntry& e : self->placed_resources)
+            if (e.resource) e.resource->Release();
         delete self;
         if (real) real->Release();
     }
@@ -1580,6 +1596,90 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Xbox device slot 127: CreateCommittedResource3(heapProps, heapFlags, desc1, initialLayout, clear, protectedSession,
+// numCastableFormats, pCastableFormats, riid, out).
+std::atomic<GraphicsAllocNotifier> g_graphics_alloc_notifier{nullptr};
+
+HRESULT proxy_create_committed_resource_3(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                                          D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc1,
+                                          std::uint32_t initial_layout, const D3D12_CLEAR_VALUE* clear_value,
+                                          void* /*protected_session*/, std::uint32_t /*num_castable_formats*/,
+                                          const DXGI_FORMAT* /*castable_formats*/, const IID* riid, void** out) {
+    note_slot(127);
+    if (out) *out = nullptr;
+    if (!heap_properties || !desc1 || !riid || !out) return E_POINTER;
+
+    D3D12_HEAP_PROPERTIES pc_heap = *heap_properties;
+    if (pc_heap.CreationNodeMask > 1) pc_heap.CreationNodeMask = 1;
+    if (pc_heap.VisibleNodeMask > 1) pc_heap.VisibleNodeMask = 1;
+
+    D3D12_RESOURCE_DESC pc_desc = *desc1;
+    constexpr D3D12_RESOURCE_FLAGS kPcFlags =
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+        D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(pc_desc.Flags & kPcFlags);
+    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        pc_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (pc_desc.Width == 0) pc_desc.Width = 256;
+        pc_desc.Height = 1;
+        pc_desc.DepthOrArraySize = 1;
+        pc_desc.MipLevels = 1;
+        pc_desc.SampleDesc = {1, 0};
+    } else {
+        pc_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (pc_desc.DepthOrArraySize == 0) pc_desc.DepthOrArraySize = 1;
+        if (pc_desc.SampleDesc.Count == 0) pc_desc.SampleDesc.Count = 1;
+    }
+
+    constexpr UINT kCommittedHeapFlags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
+                                         D3D12_HEAP_FLAG_HARDWARE_PROTECTED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT |
+                                         D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+    UINT raw_flags = static_cast<UINT>(heap_flags) & kCommittedHeapFlags;
+    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) raw_flags &= ~UINT(D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+    if (!(pc_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        raw_flags &= ~UINT(D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+    const auto pc_heap_flags = static_cast<D3D12_HEAP_FLAGS>(raw_flags);
+
+    const D3D12_CLEAR_VALUE* pc_clear =
+        (clear_value && pc_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+         (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+            ? clear_value
+            : nullptr;
+
+    const HRESULT hr = self->real->CreateCommittedResource(&pc_heap, pc_heap_flags, &pc_desc,
+                                                           D3D12_RESOURCE_STATE_COMMON, pc_clear, *riid, out);
+    std::uint64_t alloc_bytes = 0;
+    if (SUCCEEDED(hr)) {
+        if (GraphicsAllocNotifier notifier = g_graphics_alloc_notifier.load(std::memory_order_acquire)) {
+            const D3D12_RESOURCE_ALLOCATION_INFO info = self->real->GetResourceAllocationInfo(0, 1, &pc_desc);
+            alloc_bytes = info.SizeInBytes;
+            if (alloc_bytes == UINT64_MAX || alloc_bytes == 0) {
+                alloc_bytes = (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                                  ? ((pc_desc.Width + 0xFFFFULL) & ~0xFFFFULL)
+                                  : ((pc_desc.Width * pc_desc.Height * 4ULL + 0xFFFFULL) & ~0xFFFFULL);
+            }
+            notifier(static_cast<std::size_t>(alloc_bytes));
+        }
+    }
+    static std::atomic<bool> logged{false};
+    if (first_call(logged) || FAILED(hr)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 127 CreateCommittedResource3(dim=%d w=%llu h=%u fmt=%d flags=0x%x layout=%u "
+                     "heap_flags=0x%x alloc=%llu) -> hr=0x%lx\n",
+                     static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
+                     static_cast<unsigned>(pc_desc.Height), static_cast<int>(pc_desc.Format),
+                     static_cast<unsigned>(pc_desc.Flags), static_cast<unsigned>(initial_layout),
+                     static_cast<unsigned>(pc_heap_flags), static_cast<unsigned long long>(alloc_bytes),
+                     static_cast<unsigned long>(hr));
+    }
+    return hr;
+}
+
 // Xbox device slot 133: CreatePlacedResourceX(va, desc, state, clear, riid, out).
 // The shape matches the console placed resource creation. A committed DEFAULT-heap buffer is created from desc
 // with Flags restricted to valid PC flags, mapping state 0xFFFFFFFF to D3D12_RESOURCE_STATE_COMMON.
@@ -1617,8 +1717,99 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
                      static_cast<unsigned>(desc->Flags));
     }
 
-    return self->real->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &pc_desc,
-                                               pc_state, clear, *riid, out);
+    const HRESULT hr = self->real->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &pc_desc,
+                                                           pc_state, clear, *riid, out);
+    if (SUCCEEDED(hr) && out && *out && pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        ID3D12Resource* tracked = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(__uuidof(ID3D12Resource),
+                                                                    reinterpret_cast<void**>(&tracked))) &&
+            tracked) {
+            const std::lock_guard lock(self->placed_srv_mu);
+            self->placed_resources.push_back(PlacedResourceEntry{va, pc_desc.Width, tracked});
+        }
+    }
+    return hr;
+}
+
+D3D12_RESOURCE_DESC sanitize_placed_desc(const D3D12_RESOURCE_DESC& in) {
+    D3D12_RESOURCE_DESC pc_desc = in;
+    constexpr D3D12_RESOURCE_FLAGS kSrvSafeFlags =
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+        D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(pc_desc.Flags & kSrvSafeFlags);
+    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        pc_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (pc_desc.Width == 0) pc_desc.Width = 256;
+        pc_desc.Height = 1;
+        pc_desc.DepthOrArraySize = 1;
+        pc_desc.MipLevels = 1;
+        pc_desc.SampleDesc = {1, 0};
+    } else {
+        pc_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (pc_desc.DepthOrArraySize == 0) pc_desc.DepthOrArraySize = 1;
+        if (pc_desc.SampleDesc.Count == 0) pc_desc.SampleDesc.Count = 1;
+    }
+    return pc_desc;
+}
+
+// Xbox device slot 70: CreatePlacementShaderResourceViewX(resource_desc, view_desc, dest_cpu_ptr).
+// On PC slot 70 is ID3D12Device8::CreatePlacedResource1 (7 args, first arg ID3D12Heap*). We distinguish the Xbox
+// 3-arg placement SRV call when a1..a3 are non-null and a1 begins with a D3D12_RESOURCE_DESC Dimension (1..4) and
+// valid Alignment (0 or power of 2).
+void proxy_create_placement_srv_x(DeviceProxy* self, const D3D12_RESOURCE_DESC* rdesc,
+                                  const void* placement_view, std::uint64_t dest_ptr) {
+    const D3D12_RESOURCE_DESC pc_desc = sanitize_placed_desc(*rdesc);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    std::memcpy(&srv_desc, placement_view, sizeof(srv_desc));
+    std::uint64_t gpu_va = 0;
+    std::memcpy(&gpu_va, static_cast<const std::uint8_t*>(placement_view) + 0x28, sizeof(gpu_va));
+
+    ID3D12Resource* res = nullptr;
+    HRESULT hr = S_OK;
+    bool cached = false;
+    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && gpu_va) {
+        const std::lock_guard lock(self->placed_srv_mu);
+        for (const PlacedResourceEntry& e : self->placed_resources) {
+            if (gpu_va >= e.va && (gpu_va - e.va) < e.size) {
+                res = e.resource;
+                cached = true;
+                const std::uint64_t offset = gpu_va - e.va;
+                if (srv_desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && offset) {
+                    const std::uint64_t stride = (srv_desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4
+                                                 : srv_desc.Buffer.StructureByteStride ? srv_desc.Buffer.StructureByteStride
+                                                                                       : 4;
+                    srv_desc.Buffer.FirstElement += offset / stride;
+                }
+                break;
+            }
+        }
+    }
+    if (!res) {
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hr = self->real->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &pc_desc,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 __uuidof(ID3D12Resource), reinterpret_cast<void**>(&res));
+        if (SUCCEEDED(hr) && res) {
+            const std::lock_guard lock(self->placed_srv_mu);
+            self->placed_srv_resources.push_back(res);
+            if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && gpu_va) {
+                res->AddRef();
+                self->placed_resources.push_back(PlacedResourceEntry{gpu_va, pc_desc.Width, res});
+            }
+        }
+    }
+
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 70 PlacementSRV(dim=%d width=%llu fmt=%d view_dim=%d va=0x%llx cached=%d) -> hr=0x%lx\n",
+                     static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
+                     static_cast<int>(srv_desc.Format), static_cast<int>(srv_desc.ViewDimension),
+                     static_cast<unsigned long long>(gpu_va), cached ? 1 : 0, static_cast<unsigned long>(hr));
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE dest{static_cast<SIZE_T>(dest_ptr)};
+    self->real->CreateShaderResourceView((SUCCEEDED(hr) && res) ? res : nullptr, &srv_desc, dest);
 }
 
 template <unsigned Slot>
@@ -1647,6 +1838,33 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 25) {
+        // Struct-returning method: GetResourceAllocationInfo returns D3D12_RESOURCE_ALLOCATION_INFO (16 bytes).
+        // PC MSVC expects (this, return_buffer, visibleMask, numResourceDescs, pResourceDescs).
+        // Xbox caller passes (return_buffer, this, visibleMask, numResourceDescs, pResourceDescs).
+        DeviceProxy* dev = self;
+        void* ret_buf = reinterpret_cast<void*>(a1);
+        std::uint32_t visible_mask = static_cast<std::uint32_t>(a2);
+        std::uint32_t num_descs = static_cast<std::uint32_t>(a3);
+        const auto* in_descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4);
+        if (a1 && a1 > 0x10000 && reinterpret_cast<DeviceProxy*>(a1)->real) {
+            dev = reinterpret_cast<DeviceProxy*>(a1);
+            ret_buf = reinterpret_cast<void*>(self);
+        }
+        note_slot(25);
+        std::vector<D3D12_RESOURCE_DESC> sanitized;
+        const D3D12_RESOURCE_DESC* descs_arg = in_descs;
+        if (in_descs && num_descs > 0 && num_descs <= 1024) {
+            sanitized.reserve(num_descs);
+            for (std::uint32_t i = 0; i < num_descs; ++i) sanitized.push_back(sanitize_placed_desc(in_descs[i]));
+            descs_arg = sanitized.data();
+        }
+        const D3D12_RESOURCE_ALLOCATION_INFO alloc_info =
+            dev->real->GetResourceAllocationInfo(visible_mask, num_descs, descs_arg);
+        if (ret_buf) {
+            *reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(ret_buf) = alloc_info;
+        }
+        return reinterpret_cast<std::uint64_t>(ret_buf);
     } else if constexpr (Slot == 26) {
         // Struct-returning method: GetCustomHeapProperties returns D3D12_HEAP_PROPERTIES.
         // PC MSVC expects (this, return_buffer, node_mask, heap_type).
@@ -1690,6 +1908,14 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 127) {
+        return hr_to_u64(proxy_create_committed_resource_3(
+            self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
+            static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(a2)),
+            reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3), static_cast<std::uint32_t>(a4),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<void*>(a6),
+            static_cast<std::uint32_t>(a7), reinterpret_cast<const DXGI_FORMAT*>(a8),
+            reinterpret_cast<const IID*>(a9), reinterpret_cast<void**>(a10)));
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_x(
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
@@ -1733,6 +1959,16 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
             return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                          reinterpret_cast<void**>(a5)));
+        }
+        if (Slot == 70 && a1 && a2 && a3) {
+            const auto* rd = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a1);
+            if (rd->Dimension >= D3D12_RESOURCE_DIMENSION_BUFFER &&
+                rd->Dimension <= D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                (rd->Alignment == 0 || (rd->Alignment & (rd->Alignment - 1)) == 0)) {
+                log_xbox_route_once(Slot, "CreatePlacementShaderResourceViewX", a1, a2, a3, a4, a5);
+                proxy_create_placement_srv_x(self, rd, reinterpret_cast<const void*>(a2), a3);
+                return 0;
+            }
         }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
@@ -1879,10 +2115,14 @@ ID3D12Device* device_proxy_real_device(const void* device) {
     return static_cast<const DeviceProxy*>(device)->real;
 }
 
+void set_graphics_alloc_notifier(GraphicsAllocNotifier fn) {
+    g_graphics_alloc_notifier.store(fn, std::memory_order_release);
+}
+
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
-        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76 || slot == 133)
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
+        slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+        slot == 75 || slot == 76 || slot == 127 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
