@@ -290,23 +290,29 @@ class ComputedIJRefusals(unittest.TestCase):
         old = rdna2spirv.BARY_FALLBACK
         rdna2spirv.BARY_FALLBACK = True
         try:
-            self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
-                         "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
-                        "computed I/J pair under --bary-fallback")
+            spv = support.translate_lines("ps_ij_bary_fb", [
+                "v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+            self.assertNotIn("PerVertexKHR", spv)
+            self.assertNotIn("FragmentBarycentricKHR", spv)
+            self.assertIn("OpDPdx", spv)
+            self.assertIn("OpDPdy", spv)
         finally:
             rdna2spirv.BARY_FALLBACK = old
 
     def test_computed_pair_under_f16_interp_fallback(self):
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs to
-        # weight with a computed pair (same regime as --bary-fallback)
+        # --f16-interp-fallback reads decoded halves without PerVertexKHR: computed I/J uses quad derivatives.
         old = rdna2spirv.F16_HALVES
         rdna2spirv.F16_HALVES = True
         try:
-            self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
-                         "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
-                        "computed I/J pair under --f16-interp-fallback")
+            spv = support.translate_lines("ps_ij_f16_fb", [
+                "v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+            self.assertNotIn("PerVertexKHR", spv)
+            self.assertIn("OpDPdx", spv)
+            self.assertIn("OpDPdy", spv)
         finally:
             rdna2spirv.F16_HALVES = old
 

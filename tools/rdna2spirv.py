@@ -263,6 +263,8 @@ class Gen:
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
+        self.ij_inputs = {}         # (input_var_name, comp) -> index for quad-derivative computed I/J fallback
+        self.uses_bary = False
         self.uses_psb = False
         self.uses_active = False
         self.vm_latch = False      # PS: EXEC can change after a `vm` or color export, so EXEC at those is kept
@@ -13567,6 +13569,8 @@ class Gen:
             name = f"%in_f16h{n}_{half}"
             self.inputs.setdefault(name, None)  # resolved in assemble() once every raw attribute is known
             self.interpolated.add(name)
+            if ij is not None and not flat:
+                return self._interp_ij_derivative(name, comp, ij)
             p, v = self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
             self.emit(f"{v} = OpLoad %float {p}")
@@ -13576,6 +13580,8 @@ class Gen:
         if not flat:
             self.interpolated.add(name)
         if n not in self.per_vertex:
+            if ij is not None and not flat:
+                return self._interp_ij_derivative(name, comp, ij)
             p, v = self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
             self.emit(f"{v} = OpLoad %float {p}")
@@ -13614,6 +13620,34 @@ class Gen:
         self.emit(f"{m2} = OpFMul %float {d2} {j}")
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
+
+    def _interp_ij_derivative(self, input_name, comp, ij):
+        """Computed I/J without PerVertexKHR (--bary-fallback / --f16-interp-fallback): re-interpolate smooth
+        input via screen-space quad Jacobian from %bary and input derivatives precomputed in %entry."""
+        self.uses_bary = True
+        self.cu(comp)
+        idx = self.ij_inputs.setdefault((input_name, comp), len(self.ij_inputs))
+        i_new, j_new = ij
+        du, dv = self.tmp(), self.tmp()
+        self.emit(f"{du} = OpFSub %float {i_new} %ij_icur")
+        self.emit(f"{dv} = OpFSub %float {j_new} %ij_jcur")
+        nx1, nx2, nx, ny1, ny2, ny = (self.tmp() for _ in range(6))
+        self.emit(f"{nx1} = OpFMul %float {du} %ij_djdy")
+        self.emit(f"{nx2} = OpFMul %float {dv} %ij_didy")
+        self.emit(f"{nx} = OpFSub %float {nx1} {nx2}")
+        self.emit(f"{ny1} = OpFMul %float %ij_didx {dv}")
+        self.emit(f"{ny2} = OpFMul %float %ij_djdx {du}")
+        self.emit(f"{ny} = OpFSub %float {ny1} {ny2}")
+        dx, dy = self.tmp(), self.tmp()
+        self.emit(f"{dx} = OpFDiv %float {nx} %ij_safe_det")
+        self.emit(f"{dy} = OpFDiv %float {ny} %ij_safe_det")
+        tx, ty, s1, s2, res = (self.tmp() for _ in range(5))
+        self.emit(f"{tx} = OpFMul %float {dx} %ij_dvdx_{idx}")
+        self.emit(f"{ty} = OpFMul %float {dy} %ij_dvdy_{idx}")
+        self.emit(f"{s1} = OpFAdd %float %ij_v_{idx} {tx}")
+        self.emit(f"{s2} = OpFAdd %float {s1} {ty}")
+        self.emit(f"{res} = OpSelect %float %ij_nz {s2} %ij_v_{idx}")
+        return res
 
     def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
@@ -14610,7 +14644,7 @@ def assemble(gen):
         if gen.uses_viewport:
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"] + (["%pc_tail"] if gen.uses_pc_tail else [])
-    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex)
+    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex) or gen.uses_bary
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
@@ -15259,6 +15293,29 @@ def assemble(gen):
                 continue
             fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
                    f"%fcp{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %fcp{c} %fcu{c}"]
+    if gen.ij_inputs:
+        fn += [
+            "%ij_bc = OpLoad %v3float %bary",
+            "%ij_icur = OpCompositeExtract %float %ij_bc 1",
+            "%ij_jcur = OpCompositeExtract %float %ij_bc 2",
+            "%ij_didx = OpDPdx %float %ij_icur",
+            "%ij_didy = OpDPdy %float %ij_icur",
+            "%ij_djdx = OpDPdx %float %ij_jcur",
+            "%ij_djdy = OpDPdy %float %ij_jcur",
+            "%ij_p1 = OpFMul %float %ij_didx %ij_djdy",
+            "%ij_p2 = OpFMul %float %ij_didy %ij_djdx",
+            "%ij_det = OpFSub %float %ij_p1 %ij_p2",
+            "%ij_abs = OpExtInst %float %glsl FAbs %ij_det",
+            "%ij_nz = OpFOrdGreaterThan %bool %ij_abs %f0",
+            "%ij_safe_det = OpSelect %float %ij_nz %ij_det %f1",
+        ]
+        for (input_name, comp), idx in gen.ij_inputs.items():
+            fn += [
+                f"%ij_p_{idx} = OpAccessChain %_ptr_Input_float {input_name} {gen.cu(comp)}",
+                f"%ij_v_{idx} = OpLoad %float %ij_p_{idx}",
+                f"%ij_dvdx_{idx} = OpDPdx %float %ij_v_{idx}",
+                f"%ij_dvdy_{idx} = OpDPdy %float %ij_v_{idx}",
+            ]
     for reg, ctype in gen.vertex_inputs:
         vt = {1: "%v4uint_in", 2: "%v4int_in"}.get(ctype, "%v4float")
         st = {1: "%uint", 2: "%int"}.get(ctype, "%float")
@@ -16053,11 +16110,10 @@ def interp_ij_analysis(insns, g):
         if s["src"] in (0, 1):
             g.frag_inputs[s["src"]] = ("bary_i", "bary_j")[s["src"]]
         attrs.add(s["attr"])
-    if attrs and BARY_FALLBACK:
-        raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
-    if attrs and F16_HALVES:
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either
-        raise Unsupported("computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs")
+    if attrs and (BARY_FALLBACK or F16_HALVES):
+        # Without PerVertexKHR inputs, Gen.attribute re-interpolates smooth attributes from %bary and quad derivatives.
+        g.uses_bary = True
+        return set()
     return attrs
 
 
