@@ -183,6 +183,8 @@ def main(argv=None) -> int:
     ap.add_argument("--mcpu", default="gfx1030",
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python", "auto"), default="llvm-mc",
+                    help="disassembler backend for --disasm (default llvm-mc; auto falls back to python on invalid words)")
     a = ap.parse_args(argv)
     # An output in the input folder can replace a .dxbc input and, when the input is the folder itself,
     # os.makedirs writes there before open() tries to read the folder as a file. Refuse before either.
@@ -254,14 +256,21 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                backend_used = "python" if a.backend == "python" else "llvm-mc"
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, backend=backend_used)
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)
                     bad += 1
                     continue
+                if a.backend == "auto" and invalid > 0:
+                    asm_py, invalid_py, err_py = disasm.disasm(blob[6][start:end], a.mcpu, backend="python")
+                    if asm_py.strip() and invalid_py < invalid:
+                        asm, invalid, err = asm_py, invalid_py, err_py
+                        backend_used = "python"
                 entry["invalid_words"] = invalid
-                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
+                label = backend_used if backend_used == "python" else a.mcpu
+                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {label}, {invalid} invalid words\n" + asm
                 if err.strip():
                     listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
             if container:

@@ -1350,7 +1350,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
-FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
+FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py", "rdna2_decode.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
 
 
 def file_sha256(path: str) -> str:
@@ -1410,7 +1410,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
-    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
+    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm", "--backend", "auto")
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
     clash = fspx_key_clash(spirv)

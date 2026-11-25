@@ -179,7 +179,7 @@ class FspxStage(unittest.TestCase):
     def test_runs_once_then_nothing(self):
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         (_, unpack), (_, translate) = self.calls
-        self.assertEqual(unpack, (self.dll, "--out", self.unpacked, "--disasm"))
+        self.assertEqual(unpack, (self.dll, "--out", self.unpacked, "--disasm", "--backend", "auto"))
         self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
