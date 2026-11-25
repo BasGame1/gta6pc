@@ -1946,15 +1946,8 @@ bool init_sdl() {
     return true;
 }
 
-void poll_once() {
+void sync_gamepads(bool allow_close, uint64_t now) {
     State& s = g();
-    std::lock_guard pl(s.poll_mu);
-    if (!init_sdl()) return;
-    apply_prompt_config();
-    update_keyboard_pad();
-    SDL_UpdateGamepads();
-    const uint64_t now = now_us();
-
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     std::vector<SDL_JoystickID> present(ids, ids + (ids ? count : 0));
@@ -1965,9 +1958,11 @@ void poll_once() {
         std::lock_guard lock(s.mu);
         connected = s.connected;
     }
-    for (Device* d : connected)
-        if (std::find(present.begin(), present.end(), d->id) == present.end() || !SDL_GamepadConnected(d->pad))
-            close_pad(d, now);
+    if (allow_close) {
+        for (Device* d : connected)
+            if (std::find(present.begin(), present.end(), d->id) == present.end() || !SDL_GamepadConnected(d->pad))
+                close_pad(d, now);
+    }
     for (SDL_JoystickID jid : present) {
         bool known = false;
         {
@@ -1976,7 +1971,25 @@ void poll_once() {
         }
         if (!known) open_pad(jid, now);
     }
+}
 
+void poll_once() {
+    State& s = g();
+    std::lock_guard pl(s.poll_mu);
+    if (!init_sdl()) return;
+    apply_prompt_config();
+    SDL_UpdateGamepads();
+    const uint64_t now = now_us();
+    // Open physical controllers before attaching the keyboard pad so a connected pad takes player 1.
+    sync_gamepads(true, now);
+    const bool had_kb = g_keyboard.js != nullptr;
+    update_keyboard_pad();
+    if (had_kb || g_keyboard.js) {
+        SDL_UpdateGamepads();
+        sync_gamepads(true, now);
+    }
+
+    std::vector<Device*> connected;
     {
         std::lock_guard lock(s.mu);
         connected = s.connected;

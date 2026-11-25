@@ -916,6 +916,18 @@ void test_keyboard_pad(IGameInput* input) {
               (kb->GetDeviceStatus() & GameInputDeviceConnected),
           "keyboard pad: on again is the same device object");
 
+    set_env("LEONIDA_KEYBOARD_PAD", "off");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    Pad physical;
+    attach(physical, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    set_env("LEONIDA_KEYBOARD_PAD", "1");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 2 && physical.player == 0,
+          "keyboard pad: a connected physical pad takes player 1 before the keyboard pad");
+    detach(physical);
+
     set_env("LEONIDA_KEYBOARD_PAD", nullptr);
     rt::gameinput::reload_config();
     rt::gameinput::poll();
