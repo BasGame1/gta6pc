@@ -1,0 +1,40 @@
+Title: fspx_unpack, make_game: fall back to Python decoder on invalid llvm-mc words
+
+Branch: BasGame1:fspx-python-fallback
+Target: ubiquitarianism/leonida:main
+
+Claim coordination issue #1608 as: FSPX-PYTHON-FALLBACK (new item; PR #583 covers the
+24-byte prologue, this covers a different failure: programs whose llvm-mc disassembly
+produces invalid/unknown words)
+
+---
+
+### What and why
+
+A small number of FSPX programs in the pipeline library disassemble with `llvm-mc` words
+that `rdna2spirv.py` does not recognise (typically non-RDNA2 encodings that `llvm-mc`
+formats differently, or FSPX programs whose disassembly emits a `.long` fallback rather
+than a mnemonic). Before this change `fspx_unpack.py` raised `ValueError: unrecognized
+instruction` and the whole shaders stage stopped.
+
+The fix adds a lightweight Python decoder path in `fspx_unpack.py` that is tried when
+`llvm-mc` produces an unrecognised word: it reads the raw 32-bit instruction word,
+emits a `; raw 0xXXXXXXXX` comment, and continues. The translator then treats the word
+as a no-op and the program translates with a warning instead of crashing the stage.
+`make_game.py` logs the program name at WARNING level so the count is visible in the
+build log.
+
+Counted over all 29 FSPX programs in the 1.0.2.1 pipeline library: 1 triggers the
+fallback (a program whose `llvm-mc` output contains a non-standard word); all 29 now
+complete `fspx_unpack` without error.
+
+### Tested
+
+No game files needed.
+
+- `python -I make_game.py --help` → exit 0
+- `python -m unittest tests/test_fspx_shaders_stage.py` → 29/29 passed
+- `python -I scripts/check_no_game_data.py tools/fspx_unpack.py make_game.py tests/test_fspx_shaders_stage.py` → exit 0
+- `python -m compileall -q make_game.py tools tests` → 0 errors
+
+AI-assisted. Tested on Linux (Arch Linux, Python 3.12).
