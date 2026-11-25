@@ -111,7 +111,7 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
     } else if (dll == "xaudio2_9.dll" || dll == "xaudio2_9redist.dll") {
         if (name == "XAudio2Create") return ReturnClass::HResult;
     } else if (dll == "gameinput.dll") {
-        if (name == "GameInputCreate") return ReturnClass::HResult;
+        if (name == "GameInputCreate" || name == "#1") return ReturnClass::HResult;
     } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {

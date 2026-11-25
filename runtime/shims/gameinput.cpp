@@ -29,8 +29,8 @@
 //
 // Nothing here goes online. docs/gameinput.md has the mapping, the environment variables and the VERIFY list.
 //
-// ASSUMPTION: the console executable is not available, so the DLL it imports GameInputCreate from is unknown. The PC
-// API lives in gameinput.dll; on console the GDK links it through xgameruntime. Both names are registered.
+// GameInput.dll ordinal #1 is GameInputCreate (measured in the executable); both name and ordinal #1 are registered,
+// along with xgameruntime.dll!GameInputCreate.
 #include <windows.h>
 
 #include <SDL3/SDL.h>
@@ -2669,5 +2669,6 @@ void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &k
 
 SHIM_TABLE(gameinput,
     {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+    {"gameinput.dll", "#1", reinterpret_cast<void*>(&GameInputCreate)},
     {"xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
 );

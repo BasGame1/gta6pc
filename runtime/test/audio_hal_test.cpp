@@ -178,10 +178,70 @@ int main() {
     auto ds_factory = reinterpret_cast<DStorageGetFactoryFn>(rt::shims::find("xcrdapi.dll", "DStorageGetFactory"));
     check(ds_factory != nullptr, "DStorageGetFactory registered for xcrdapi.dll");
     if (ds_factory) {
-        void* factory = reinterpret_cast<void*>(0x12345678);
+        void* factory = nullptr;
         HRESULT hr = ds_factory(nullptr, &factory);
-        check(FAILED(hr), "DStorageGetFactory returns failure (E_NOTIMPL)");
-        check(factory == nullptr, "DStorageGetFactory zeroes out out_factory");
+        check(SUCCEEDED(hr) && factory != nullptr, "DStorageGetFactory returns COM factory");
+        if (factory) {
+            auto** fvt = *reinterpret_cast<void***>(factory);
+            auto set_staging = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t)>(fvt[8]);
+            check(SUCCEEDED(set_staging(factory, 32u << 20)), "IDStorageFactoryX::SetStagingBufferSize succeeds");
+
+            void* status = nullptr;
+            auto create_status =
+                reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, const char*, const void*, void**)>(
+                    fvt[5]);
+            check(SUCCEEDED(create_status(factory, 4, "test", nullptr, &status)) && status != nullptr,
+                  "CreateStatusArray succeeds");
+
+            struct {
+                uint64_t source_type;
+                uint16_t capacity;
+                uint8_t priority;
+                uint8_t reserved[5];
+                const char* name;
+                void* device;
+            } qdesc{1, 64, 0, {}, "testq", nullptr};
+            void* queue = nullptr;
+            auto create_q1 =
+                reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, const void*, const void*, void**)>(fvt[10]);
+            check(SUCCEEDED(create_q1(factory, &qdesc, nullptr, &queue)) && queue != nullptr,
+                  "CreateQueue1 succeeds");
+
+            if (queue && status) {
+                auto** qvt = *reinterpret_cast<void***>(queue);
+                auto** svt = *reinterpret_cast<void***>(status);
+                const unsigned char src[8] = {'L', 'E', 'O', 'N', 'I', 'D', 'A', '!'};
+                unsigned char dst[8] = {};
+                struct {
+                    uint64_t options;
+                    void* destination;
+                    uint64_t reserved_dest;
+                    uint32_t destination_size;
+                    uint32_t reserved_size;
+                    const void* source;
+                    uint64_t file_offset;
+                    uint32_t source_size;
+                    uint32_t flags;
+                    uint64_t tag;
+                    const char* name;
+                } req{1ull << 22, dst, 0, 8, 0, src, 0, 8, 0, 0, nullptr};
+                HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*, const void*)>(qvt[3])(queue, &req);
+                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*, void*, uint32_t)>(qvt[4])(queue, status, 0);
+                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*, HANDLE)>(qvt[6])(queue, ev);
+                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(qvt[7])(queue);
+                const BOOLEAN done = reinterpret_cast<BOOLEAN(STDMETHODCALLTYPE*)(void*, uint32_t)>(svt[3])(status, 0);
+                const HRESULT shr = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t)>(svt[4])(status, 0);
+                check(done == TRUE && shr == S_OK, "DirectStorage status completed S_OK");
+                check(std::memcmp(dst, src, 8) == 0, "DirectStorage memory request copied bytes");
+                check(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0, "DirectStorage EnqueueSetEvent signalled");
+                CloseHandle(ev);
+                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(qvt[8])(queue);
+                reinterpret_cast<unsigned long(STDMETHODCALLTYPE*)(void*)>(qvt[2])(queue);
+                reinterpret_cast<unsigned long(STDMETHODCALLTYPE*)(void*)>(svt[2])(status);
+            }
+            reinterpret_cast<unsigned long(STDMETHODCALLTYPE*)(void*)>(fvt[2])(factory);
+        }
     }
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
