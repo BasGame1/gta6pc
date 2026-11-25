@@ -1,38 +1,3 @@
 Title: runtime/shims: map Wine STATUS_NOT_IMPLEMENTED to STATUS_NOT_FOUND in bcrypt_rng
 
-Branch: BasGame1:wine-bcrypt-rng
-Target: ubiquitarianism/leonida:main
-
-Claim coordination issue #1608 as: RT-BCRYPT-RNG-STATUS-WINE (new item; no open PR covers
-this specific bcrypt_rng Wine STATUS_NOT_IMPLEMENTED → STATUS_NOT_FOUND mapping)
-
----
-
-### What and why
-
-Windows' `BCryptOpenAlgorithmProvider` returns `STATUS_NOT_FOUND` (0xC0000225) when asked
-for an algorithm name it does not recognise. Wine's `bcrypt.dll` returns
-`STATUS_NOT_IMPLEMENTED` (0xC0000002) for the same case.
-
-The game's crypto-initialization code checks the return value against `STATUS_NOT_FOUND`
-to decide whether to skip an optional algorithm. Under Wine the call returns
-`STATUS_NOT_IMPLEMENTED` instead, the check fails, and the game tries to use the NULL
-handle — crashing shortly after.
-
-The fix adds a one-liner in the shim's `open_algorithm_provider`: when the host call
-returns `STATUS_NOT_IMPLEMENTED` the shim returns `STATUS_NOT_FOUND` to the caller,
-matching the Windows answer on both hosts.
-
-Credits-To: ProjectLeonidaL/leonida contributors (Orkan, et al.)
-Extracted-From: https://github.com/ProjectLeonidaL/leonida commit 2fe31abcc
-
-### Tested
-
-Linux + Wine 11.22.
-
-- Windows CMake build (clang-cl cross) → `wine runtime/build/windows/bcrypt_rng_test.exe`:
-  21/21 checks passed (the previously-failing unknown-algorithm case now returns
-  STATUS_NOT_FOUND as expected)
-- `python -I scripts/check_no_game_data.py runtime/shims/bcrypt_rng.cpp` → exit 0
-
-AI-assisted. Tested on Linux + Wine 11.22 (Arch Linux, kernel 6.14).
+Body: Windows BCryptOpenAlgorithmProvider returns STATUS_NOT_FOUND when asked for an algorithm name it does not recognise. Wine bcrypt.dll returns STATUS_NOT_IMPLEMENTED for the same call. The game's crypto-initialisation code checks the return value against STATUS_NOT_FOUND to decide whether to skip an optional algorithm; under Wine the call returns STATUS_NOT_IMPLEMENTED instead, the check fails, and the game tries to use the resulting NULL handle and crashes shortly after. The fix adds a one-liner in the shim's open_algorithm_provider: when the host call returns STATUS_NOT_IMPLEMENTED the shim returns STATUS_NOT_FOUND to the caller, matching the Windows answer on both hosts. Tested on Linux with Wine 11.22: the Windows cross-build bcrypt_rng_test.exe passes 21 of 21 checks under Wine including the previously-failing unknown-algorithm case that now returns STATUS_NOT_FOUND as expected, and check_no_game_data.py exits 0. Credits-To: ProjectLeonidaL/leonida contributors Orkan. Extracted-From: https://github.com/ProjectLeonidaL/leonida commit 2fe31abcc. AI-assisted. Claimed as RT-BCRYPT-RNG-STATUS-WINE in issue #1608.
