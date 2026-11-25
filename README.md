@@ -322,6 +322,8 @@ pull requests.
 - [Leonida Continued](https://github.com/ubiquitarianism/leonida) by ubiquitarianism and contributors (including
   Moriz82, OreoFR, Mby159, aslan2142, TheGeogeo, MoonEyes, and others): post-story-load runtime, DirectStorage,
   AcpHal/CHAD/XAPU/WS2/SilentAudio shims, console D3D12 ABI and Vulkan backend advances, and translator improvements.
+- [ProjectLeonidaL](https://github.com/ProjectLeonidaL/leonida) by Orkan, ManDrake-hub, and contributors: Wine
+  root-signature zero-checksum and `MAXIMUM_ALLOWED` file-system shim fixes.
 - [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) by breadbbbb: the RPF9 model, texture-pool and AWC
   decoders used by `tools/rpf9dump` (git submodule).
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (MIT): GFX10 resource-descriptor layout (`tools/gfx10_formats.json`),
