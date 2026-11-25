@@ -1821,6 +1821,27 @@ void test_window_carve_keeps_rest(const PhysicalApi& api) {
     check(api.free_pages(3, pages) == TRUE, "free the three pages");
 }
 
+// Mapping the tail page of an unsplit sub-window still splits it when BaseAddress matches but AllocationBase starts
+// earlier (Wine's VirtualQuery adjusts BaseAddress even inside an unsplit placeholder).
+void test_placeholder_tail_split(const PhysicalApi& api) {
+    auto* const window = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, 3 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    check(window != nullptr, "a 3-page placeholder window for tail split");
+    if (!window) return;
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == 2, "allocate two pages for tail split");
+    if (count != 2) return;
+    check(api.map(window, 1, &pages[0]) == window, "map the head page so the tail stays an unsplit 2-page placeholder");
+    check(api.map(window + 2 * kPage64k, 1, &pages[1]) == window + 2 * kPage64k,
+          "map the tail page of the remaining unsplit placeholder");
+    fill_page(window + 2 * kPage64k, 0x7100000u);
+    check(page_holds(window + 2 * kPage64k, 0x7100000u), "the mapped tail page holds data");
+    check(api.map(window, 1, nullptr) == window, "unmap the head page");
+    check(api.map(window + 2 * kPage64k, 1, nullptr) == window + 2 * kPage64k, "unmap the tail page");
+    check(api.free_pages(2, pages) == TRUE, "free the tail-split pages");
+}
+
 // A reserve-only replacement splits an existing physical window without releasing either neighbour.
 void test_nested_window(const PhysicalApi& api) {
     auto* base = static_cast<uint8_t*>(api.virtual_alloc(nullptr, 3 * kPage64k, MEM_RESERVE | kXmem64kPages,
@@ -2700,6 +2721,7 @@ int main(int argc, char** argv) {
         test_split_under_reader(physical);
         test_placeholders(physical);
         test_window_carve_keeps_rest(physical);
+        test_placeholder_tail_split(physical);
         test_nested_window(physical);
         test_write_combine_window(physical);
         test_heap_lock_faults(physical);

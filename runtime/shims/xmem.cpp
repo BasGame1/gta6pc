@@ -702,8 +702,24 @@ bool isolate_placeholder(void* address, SIZE_T size) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
     }
-    if (info.BaseAddress == address && info.RegionSize == size) return true;
-    if (!VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return false;
+    // VirtualQuery(address) sets BaseAddress = address even when the placeholder starts earlier; confirm the preceding
+    // page does not share the same region before skipping the split.
+    bool exact = info.AllocationBase == address && info.RegionSize == size;
+    if (!exact && info.BaseAddress == address && info.RegionSize == size) {
+        MEMORY_BASIC_INFORMATION prev{};
+        exact = VirtualQuery(static_cast<const char*>(address) - 1, &prev, sizeof(prev)) &&
+                reinterpret_cast<uintptr_t>(prev.BaseAddress) + prev.RegionSize ==
+                    reinterpret_cast<uintptr_t>(address);
+    }
+    if (exact) return true;
+    if (!VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+        const DWORD err = GetLastError();
+        std::fprintf(stderr, "[rt] xmem: isolate_placeholder VirtualFree(%p, 0x%zx) err=%lu base=%p alloc=%p rsz=0x%zx\n",
+                     address, static_cast<size_t>(size), static_cast<unsigned long>(err), info.BaseAddress,
+                     info.AllocationBase, static_cast<size_t>(info.RegionSize));
+        SetLastError(err);
+        return false;
+    }
     leonida::title_memory_map::changed(address, size);
     return true;
 }
@@ -970,6 +986,8 @@ bool map_view(uintptr_t address, const View& view, uint64_t* done = nullptr) {
         void* const target = reinterpret_cast<void*>(base);
         MEMORY_BASIC_INFORMATION info{};
         if (!VirtualQuery(target, &info, sizeof(info)) || info.RegionSize < kPhysicalPageSize) {
+            std::fprintf(stderr, "[rt] xmem: map_view VirtualQuery(%p) failed err=%lu state=0x%lx rsz=0x%zx\n",
+                         target, static_cast<unsigned long>(GetLastError()), info.State, static_cast<size_t>(info.RegionSize));
             SetLastError(ERROR_INVALID_ADDRESS);
             return false;
         }
@@ -979,6 +997,8 @@ bool map_view(uintptr_t address, const View& view, uint64_t* done = nullptr) {
             // to the zero pool.
             const auto planted = g_views.find(base);
             if (planted == g_views.end() || planted->first != base || !planted->second.zero) {
+                std::fprintf(stderr, "[rt] xmem: map_view unexpected state=0x%lx type=0x%lx at %p (rsz=0x%zx)\n",
+                             info.State, info.Type, target, static_cast<size_t>(info.RegionSize));
                 SetLastError(ERROR_INVALID_ADDRESS);
                 return false;
             }
@@ -997,6 +1017,12 @@ bool map_view(uintptr_t address, const View& view, uint64_t* done = nullptr) {
         if (!isolate_placeholder(target, size)) return false;
         if (!placeholder_api().map_view3(view.section->handle, GetCurrentProcess(), target, offset, size,
                                          MEM_REPLACE_PLACEHOLDER, view.protect, nullptr, 0)) {
+            const DWORD err = GetLastError();
+            std::fprintf(stderr, "[rt] xmem: MapViewOfFile3(%p, off=0x%llx, sz=0x%zx, prot=0x%lx, file=%d) failed err=%lu\n",
+                         target, static_cast<unsigned long long>(offset), static_cast<size_t>(size),
+                         static_cast<unsigned long>(view.protect), view.section->file_backed ? 1 : 0,
+                         static_cast<unsigned long>(err));
+            SetLastError(err);
             return false;
         }
         leonida::title_memory_map::changed(target, size);
