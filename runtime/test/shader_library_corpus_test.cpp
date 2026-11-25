@@ -192,7 +192,7 @@ int main() {
     }
 
     if (containers == 0) fail("no .dxbc containers in", dxbc_dir);
-    const std::size_t rpf_entries = library.size() - library.fspx_size() - library.bvh_size();
+    const std::size_t rpf_entries = library.size() - library.fspx_size() - library.bvh_size() - library.exe_size();
     if (reached.size() != rpf_entries)
         fail(std::to_string(reached.size() > rpf_entries ? reached.size() - rpf_entries : rpf_entries - reached.size()) +
                  " RPF index entries not matched one to one",

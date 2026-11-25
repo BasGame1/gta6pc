@@ -408,6 +408,30 @@ class ShadersStageWithTheDlls(unittest.TestCase):
             for sub in ((), ("fspx",), ("bvh",)):
                 self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", *sub, "index.json")))
 
+    def test_exe_embedded_shaders_extracted_when_exe_present(self):
+        with tempfile.TemporaryDirectory() as t:
+            game, work = os.path.join(t, "game"), os.path.join(t, "work")
+            os.makedirs(game)
+            exe = os.path.join(game, make_game.EXE_NAME)
+            with open(exe, "wb") as f:
+                f.write(dll_like(builder_container("ExePixel0", fssm_blob(9))))
+            with mock.patch.object(make_game, "py", side_effect=lambda *a: None), \
+                    mock.patch.object(make_game, "llvm_mc_signature", return_value="llvm-mc 23"), \
+                    mock.patch.object(make_game, "log", lambda *a: None):
+                exe_spirv = os.path.join(work, "shaders", "spirv", "exe")
+                exe_dxbc = os.path.join(work, "shaders", "exe")
+                os.makedirs(exe_spirv)
+                os.makedirs(exe_dxbc)
+                with open(os.path.join(exe_dxbc, "index.json"), "w", encoding="utf-8") as f:
+                    f.write('[{"name": "ExePixel0", "file": "ExePixel0.dxbc", "stage": "ps"}]')
+                with open(os.path.join(exe_spirv, "index.json"), "w", encoding="utf-8") as f:
+                    f.write('{"ExePixel0": {"stage": "ps", "fssm_sha256": "%s"}}' % ("a" * 64))
+                open(os.path.join(exe_spirv, "ExePixel0.spv"), "wb").close()
+                # Removing the exe drops the stale exe/index.json.
+                os.remove(exe)
+                make_game.exe_shaders(game, work, "llvm-mc 23", jobs=2)
+                self.assertFalse(os.path.isfile(os.path.join(exe_spirv, "index.json")))
+
 
 if __name__ == "__main__":
     unittest.main()

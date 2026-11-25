@@ -309,6 +309,20 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
         self.assertEqual(self.run_stage(), [])
 
+    def test_updated_shaders_rpf_recarves_cleanly(self):
+        game = os.path.join(self.work, "game")
+        os.makedirs(game, exist_ok=True)
+        rpf = os.path.join(game, "shaders.rpf")
+        with open(rpf, "wb") as f:
+            f.write(b"partial-rpf")
+        self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "carve_source.json")))
+        self.assertEqual(self.run_stage(), [])
+        with open(rpf, "wb") as f:
+            f.write(b"complete-rpf-data")
+        self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+        self.assertEqual(self.run_stage(), [])
+
     def test_old_disassembly_with_a_noncurrent_shader_is_refreshed(self):
         self.run_stage()
         self.touch(self.dxbc, "disasm", "removed.s")
