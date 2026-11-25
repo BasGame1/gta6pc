@@ -548,6 +548,27 @@ inline bool a8_mixed_backing(VkFormat a, VkFormat b) {
 #endif
 }
 
+// Two depth formats whose depth aspect has the same encoding but which are not the same VkFormat: D32_SFLOAT and
+// D32_SFLOAT_S8_UINT, D16_UNORM and D16_UNORM_S8_UINT, X8_D24_UNORM_PACK32 and D24_UNORM_S8_UINT. D3D12 copies the
+// depth plane between them; Vulkan's vkCmdCopyImage requires depth/stencil formats to match exactly
+// (VUID-vkCmdCopyImage-srcImage-01548), and an NVIDIA driver handed D32_SFLOAT_S8_UINT -> D32_SFLOAT writes past the
+// end of the D32 image (the world-start WRITE_INVALID). The replay stages these through a buffer, where the depth
+// aspect has the same texel layout on both sides.
+inline bool depth_format_pair(VkFormat a, VkFormat b) {
+    const auto encoding = [](VkFormat format) -> int {
+        switch (format) {
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT: return 32;
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D24_UNORM_S8_UINT: return 24;
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_D16_UNORM_S8_UINT: return 16;
+        default: return 0;
+        }
+    };
+    return a != b && encoding(a) && encoding(a) == encoding(b);
+}
+
 inline bool depth_colour_pair(const ResourceBinding& a, const ResourceBinding& b) {
     const auto family = [](VkFormat format) -> int {
         switch (format) {
@@ -3629,7 +3650,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 (p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask ||
-                 a8_mixed_backing(p.source.format, p.binding.format))) {
+                 a8_mixed_backing(p.source.format, p.binding.format) ||
+                 depth_format_pair(p.source.format, p.binding.format))) {
                 // Depth <-> colour: vkCmdCopyImage cannot mix aspects, so each region goes image -> scratch -> image,
                 // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here. The two
                 // backings of A8_UNORM take the same route: one byte per texel on both sides, but Vulkan does not

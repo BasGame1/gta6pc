@@ -484,6 +484,13 @@ What is implemented (all of it testable without the game):
     `E_INVALIDARG` for such a render target, since no other format can view its image. Without that format,
     render targets are refused as before; depth-stencil and UAV creation are
     unsupported for this format.
+  - A `CopyTextureRegion` of the depth plane between two depth formats with the same depth encoding but not the
+    same `VkFormat` (`D32_SFLOAT_S8_UINT` and `D32_SFLOAT`, `D16_UNORM_S8_UINT` and `D16_UNORM`,
+    `D24_UNORM_S8_UINT` and `X8_D24_UNORM_PACK32`) goes image → transfer scratch → image too, depth aspect on both
+    sides (`vulkan_replay.h`, `depth_format_pair`; `replay_copy_offset_test`). `vkCmdCopyImage` requires
+    depth/stencil formats to match exactly (`VUID-vkCmdCopyImage-srcImage-01548`), and an NVIDIA driver (RTX 4070
+    Laptop, 621.40) handed the `D32_SFLOAT_S8_UINT` → `D32_SFLOAT` pair wrote past the end of the `D32_SFLOAT`
+    image: the world-start `WRITE_INVALID` device loss, with the fault at the first byte after the image.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
