@@ -3208,6 +3208,8 @@ struct DeviceState {
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
         std::vector<std::uint32_t> retries;
+        std::vector<std::uint8_t> live_vsharp;  // per slot: copy holds a non-empty V#, tracked in `live_vsharps`
+        std::vector<std::uint32_t> live_vsharps;
         std::set<std::uint32_t> empty_slots;
         std::uint32_t next_empty = 0;
         std::size_t retry_at = 0;  // where retry_console_slots goes on
@@ -3267,7 +3269,18 @@ struct DeviceState {
                 ++heap.unbacked;
                 empty = true;
             }
+            const bool live_v = (w[2] && (w[0] || (w[1] & 0xffffu))) ||
+                                (!(w[7] >> 30) && w[6] && (w[4] || (w[5] & 0xffffu)));
+            if (live_v) {
+                if (!heap.live_vsharp[slot]) {
+                    heap.live_vsharp[slot] = 1;
+                    heap.live_vsharps.push_back(std::uint32_t(slot));
+                }
+            } else {
+                heap.live_vsharp[slot] = 0;
+            }
         } else {
+            heap.live_vsharp[slot] = 0;
             leonida::gfx10::ImageWords words;
             std::memcpy(words.data(), w, sizeof(words));
             if (leonida::gfx10::is_image(words)) {
@@ -3400,7 +3413,7 @@ struct DeviceState {
             const auto first = std::uint32_t(offset / kDescriptorSize);
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
             heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
-            for (auto slot = first; slot < end; ++slot) heap.retry[slot] = 0;
+            for (auto slot = first; slot < end; ++slot) heap.retry[slot] = heap.live_vsharp[slot] = 0;
         });
         const auto t1 = clock::now();
         heap.fix_start = t1;
@@ -3412,15 +3425,24 @@ struct DeviceState {
         if (heap.resource_heap && (generation != heap.checked_generation || alias_generation != heap.alias_generation)) {
             heap.alias_generation = alias_generation;
             heap.checked_generation = generation;
-            // Even an unchanged title slot may name a buffer released since the last submission.
-            for (size_t at = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
-                auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
-                if (!(w[3] >> 30) && (w[2] || w[6])) {
-                    const auto slot = at / kDescriptorSize;
-                    if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                        heap.retry[slot] = 1;
-                        heap.retries.push_back(uint32_t(slot));
-                    }
+            // Even an unchanged title slot may name a buffer released since the last submission; check cached slots
+            // rather than reading the uncached GPU-copy buffer across the PCIe BAR.
+            for (std::size_t i = 0; i < heap.live_vsharps.size();) {
+                const std::uint32_t slot = heap.live_vsharps[i];
+                if (!heap.live_vsharp[slot]) {
+                    heap.live_vsharps[i] = heap.live_vsharps.back();
+                    heap.live_vsharps.pop_back();
+                    continue;
+                }
+                if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
+                    heap.retry[slot] = 1;
+                    heap.retries.push_back(slot);
+                }
+                if (!heap.live_vsharp[slot]) {
+                    heap.live_vsharps[i] = heap.live_vsharps.back();
+                    heap.live_vsharps.pop_back();
+                } else {
+                    ++i;
                 }
             }
         }
@@ -3640,6 +3662,7 @@ struct DeviceState {
                 heap->previous = heap->made.data();
             }
             heap->retry.assign(std::size_t(bytes / kDescriptorSize), 0);
+            heap->live_vsharp.assign(std::size_t(bytes / kDescriptorSize), 0);
             heap->pages = make_shadow_pages(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(console_va)),
                                             heap->input, std::size_t(bytes));
         }
