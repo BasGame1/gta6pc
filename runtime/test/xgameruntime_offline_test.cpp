@@ -247,6 +247,21 @@ int main() {
     check(query(&kLauncherClass, other, &none) == E_NOINTERFACE && none == nullptr,
           "XLauncherImpl refuses an interface id it doesn't implement");
 
+    // ---- XAppCapture ----
+    constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+    void* appcap = nullptr;
+    check(query(&kAppCaptureClass, kAppCaptureClass, &appcap) == S_OK && appcap, "XAppCaptureImpl for its class id");
+    if (!appcap) return 1;
+    char shot_result[128] = {1, 2, 3};
+    using TakeScreenshot = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
+    check(at<TakeScreenshot>(appcap, 5)(appcap, nullptr, shot_result) == S_OK && shot_result[0] == 0,
+          "XAppCaptureTakeScreenshot succeeds with zeroed result");
+    using SetRecord = HRESULT(STDMETHODCALLTYPE*)(void*, bool);
+    check(at<SetRecord>(appcap, 9)(appcap, true) == S_OK && at<SetRecord>(appcap, 10)(appcap, false) == S_OK,
+          "XAppCaptureEnableRecord and DisableRecord succeed");
+    check(FAILED(at<NoArgs>(appcap, 3)(appcap)) && FAILED(at<NoArgs>(appcap, 6)(appcap)),
+          "unsupported app capture methods fail offline");
+
     std::printf("xgameruntime_offline_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

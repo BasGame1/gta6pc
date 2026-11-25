@@ -288,6 +288,19 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                     self.assertEqual(ret, 0)
                     mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False, allow_missing=True)
 
+    def test_skip_space_check_flag_passed_to_preflight(self):
+        with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir, "--out", self.out_dir, "--work", self.work_dir, "--no-tui", "--stages", "shaders", "--skip-space-check"]):
+            with patch("make_game.below_normal"):
+                with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
+                    with patch("make_game.preflight") as mock_preflight:
+                        with patch("make_game.shaders"):
+                            with patch("make_game.log"):
+                                ret = make_game.main()
+                                self.assertEqual(ret, 0)
+                                self.assertTrue(mock_preflight.called)
+                                _, kwargs = mock_preflight.call_args
+                                self.assertTrue(kwargs.get("skip_space_check"))
+
     def test_compat_all_enables_all_fallback_flags(self):
         with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir, "--compat-all", "--check"]):
             with patch("make_game.below_normal"):

@@ -822,7 +822,8 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
               emulate: bool = False, keep_emulated: bool = False,
-              fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
+              fallbacks: tuple[str, ...] = (), jobs: int = 1,
+              skip_space_check: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
         absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
@@ -895,8 +896,12 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         loader_stages_selected = "shaders" in stages and "runtime" in stages
         if loader_stages_selected and not wav and assets_gb and free_gb >= need_gb - assets_gb:
             hint = " To prepare the loader without exporting assets, use --stages check,shaders,runtime."
-        fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
-             "Free some space or choose another drive with --work." + hint)
+        msg = (f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
+               "Free some space or choose another drive with --work." + hint)
+        if skip_space_check:
+            log("warning: " + msg + " (--skip-space-check: continuing anyway)")
+        else:
+            fail(msg)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
@@ -2684,6 +2689,9 @@ def main() -> int:
     ap.add_argument("--skip-check", action="store_true",
                     help="warn instead of failing when files from the manifest are missing (useful for testing "
                          "stages on partial downloads)")
+    ap.add_argument("--skip-space-check", action="store_true",
+                    help="warn instead of failing when free disk space is below minimum requirements (useful when "
+                         "drive space is tight)")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
@@ -2853,8 +2861,11 @@ def main() -> int:
         cfg = leonida_tui.run_setup(a.jobs, default_overlap=True)
         a.jobs = leonida_tui.clamp_jobs(cfg.jobs)
         overlap = cfg.overlap
+    preflight_kw = {}
+    if getattr(a, "skip_space_check", False):
+        preflight_kw["skip_space_check"] = True
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-              fallbacks=fallbacks, jobs=a.jobs)
+              fallbacks=fallbacks, jobs=a.jobs, **preflight_kw)
     if not a.out and icloud_documents():
         for note in icloud_default_notes():
             log(note)

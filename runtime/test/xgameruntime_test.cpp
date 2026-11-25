@@ -252,17 +252,18 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
         release_object(a);
     }
 
+    // XAppCaptureImpl is served offline.
+    const GUID app_capture_cls = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+    void* appcap = nullptr;
+    check(query(&app_capture_cls, app_capture_cls, &appcap) == S_OK && appcap != nullptr,
+          "XAppCaptureImpl is served offline for its class id");
+    release_object(appcap);
+
     // Classes nobody serves are still refused, and logged, as before.
-    const GUID refused[] = {
-        {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}},  // XAppCaptureImpl
-        {0x12345678, 0x9abc, 0xdef0, {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0}},  // no such class
-    };
-    bool all_refused = true;
-    for (const GUID& cls : refused) {
-        void* out = reinterpret_cast<void*>(1);
-        all_refused = all_refused && query(&cls, cls, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr;
-    }
-    check(all_refused, "XAppCaptureImpl and an unknown class are still refused");
+    const GUID refused_cls = {0x12345678, 0x9abc, 0xdef0, {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0}};  // no such class
+    void* out = reinterpret_cast<void*>(1);
+    check(query(&refused_cls, refused_cls, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr,
+          "an unknown class is still refused");
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
