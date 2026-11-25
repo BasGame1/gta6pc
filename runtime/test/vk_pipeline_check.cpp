@@ -120,6 +120,7 @@ struct ShaderMeta {
     std::vector<uint32_t> gs_output_locations;
     bool has_gs_input_locations = false;
     bool has_gs_output_locations = false;
+    bool has_mesh_compute = false;
     std::vector<VertexInputMeta> vertex_inputs;
 };
 
@@ -382,6 +383,7 @@ struct JsonParser {
             else if (k == "gs_input_locations") { m.gs_input_locations = parse_u32_array(); m.has_gs_input_locations = true; }
             else if (k == "gs_output_locations") { m.gs_output_locations = parse_u32_array(); m.has_gs_output_locations = true; }
             else if (k == "vertex_inputs") m.vertex_inputs = parse_vertex_inputs();
+            else if (k == "mesh_compute") { m.has_mesh_compute = true; skip_value(); }
             else skip_value();
             if (error) return m;
             if (consume('}')) return m;
@@ -1061,10 +1063,10 @@ int main(int argc, char** argv) {
     // Scan selected shaders to request only the optional extensions they actually use.
     bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false, want_clock = false;
     for (auto& [_, meta] : work) {
-        if (meta->stage == "ms") want_mesh = true;
+        if (meta->stage == "ms" && !meta->has_mesh_compute) want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
         for (const auto& feat : meta->features) {
-            if (feat == "meshShader") want_mesh = true;
+            if (feat == "meshShader" && !meta->has_mesh_compute) want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
             else if (feat == "shaderFmaFloat32" || feat == "shaderFmaFloat64") want_fma = true;   // OpFmaKHR (--fma khr)
@@ -1217,7 +1219,7 @@ int main(int argc, char** argv) {
                     unforced_by_sg[request.wanted].insert(meta->stage);
                 continue;
             }
-            const VkShaderStageFlagBits bit = stage_bit(meta->stage);
+            const VkShaderStageFlagBits bit = meta->has_mesh_compute ? VK_SHADER_STAGE_COMPUTE_BIT : stage_bit(meta->stage);
             if (bit && meta->subgroup_size > 0 && !can_require_sg(meta->subgroup_size, bit)) {
                 unforced_by_sg[meta->subgroup_size].insert(meta->stage);
             }
@@ -1274,8 +1276,8 @@ int main(int argc, char** argv) {
                    std::to_string(props.limits.maxPushConstantsSize) +
                    (need_pc > 128 ? " (translate with --pc-tail-ubo)" : "");
         }
-        if (is_graphics_stage(meta.stage) && !f13.dynamicRendering) return "no dynamicRendering";
-        if (meta.stage == "ms" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
+        if (!meta.has_mesh_compute && is_graphics_stage(meta.stage) && !f13.dynamicRendering) return "no dynamicRendering";
+        if (meta.stage == "ms" && !meta.has_mesh_compute && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
         if (meta.stage == "gs" && !f2.features.geometryShader) return "no geometryShader";
         if (meta.needs_maintenance8) {
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
@@ -1601,10 +1603,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             uint32_t shared_memory_limit = 0;
-            if (stage == "cs") shared_memory_limit = props.limits.maxComputeSharedMemorySize;
+            if (stage == "cs" || meta.has_mesh_compute) shared_memory_limit = props.limits.maxComputeSharedMemorySize;
             else if (stage == "ms") shared_memory_limit = mesh_props.maxMeshSharedMemorySize;
             if (shared_memory_limit && meta.lds_bytes > shared_memory_limit) {
-                const char* limit_name = stage == "cs" ? "maxComputeSharedMemorySize" : "maxMeshSharedMemorySize";
+                const char* limit_name = (stage == "cs" || meta.has_mesh_compute) ? "maxComputeSharedMemorySize" : "maxMeshSharedMemorySize";
                 std::lock_guard<std::mutex> g(mu);
                 modules_bad[stage]++;
                 std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds %s %u)\n",
@@ -1652,7 +1654,7 @@ int main(int argc, char** argv) {
                 if (mod_ok) modules_ok[stage]++;
                 else { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); }
             }
-            if (mod_ok && stage == "cs") {
+            if (mod_ok && (stage == "cs" || meta.has_mesh_compute)) {
                 const std::string miss = check_missing_feature(meta);
                 if (!miss.empty()) {
                     record_skip(name, stage, miss);
@@ -1694,7 +1696,7 @@ int main(int argc, char** argv) {
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
                     record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
                 }
-            } else if (mod_ok && is_graphics_stage(stage)) {
+            } else if (mod_ok && is_graphics_stage(stage) && !meta.has_mesh_compute) {
                 const std::string miss = check_missing_feature(meta);
                 if (!miss.empty()) {
                     record_skip(name, stage, miss);
