@@ -8493,7 +8493,12 @@ public:
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
+        if (vs_stage.entry && ps_stage.entry && vs_stage.bit != VK_SHADER_STAGE_VERTEX_BIT && !gs_stage.entry &&
+            (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
+            log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a mesh shader", 0);
+        }
         if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
+            vs_stage.bit == VK_SHADER_STAGE_VERTEX_BIT &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
             if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
