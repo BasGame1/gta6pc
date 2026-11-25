@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import struct
@@ -80,11 +81,22 @@ class Image:
             raise ValueError("not a PE image")
         sections, opt_size = struct.unpack_from("<H", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
         opt = pe + 24
-        self.pe32plus = struct.unpack_from("<H", data, opt)[0] == 0x20B
+        if opt_size < 2 or opt + opt_size > len(data):
+            raise ValueError("optional header too small or truncated")
+        opt_magic = struct.unpack_from("<H", data, opt)[0]
+        if opt_magic not in (0x10B, 0x20B):
+            raise ValueError(f"unsupported PE optional header magic 0x{opt_magic:x}")
+        self.pe32plus = opt_magic == 0x20B
+        dirs_rel = 112 if self.pe32plus else 96
+        if opt_size < dirs_rel:
+            raise ValueError("optional header too small for data directory count")
         base_off = 24 if self.pe32plus else 28  # PE32+ ImageBase at opt+24, PE32 at opt+28
         self.image_base = struct.unpack_from("<Q" if self.pe32plus else "<I", data, opt + base_off)[0]
-        dirs = opt + (112 if self.pe32plus else 96)
-        self.dirs = [struct.unpack_from("<II", data, dirs + 8 * i) for i in range(16)]
+        dirs = opt + dirs_rel
+        num_dirs = struct.unpack_from("<I", data, dirs - 4)[0]
+        readable_dirs = min(num_dirs, (opt_size - dirs_rel) // 8, 16)
+        self.dirs = [struct.unpack_from("<II", data, dirs + 8 * i) for i in range(readable_dirs)]
+        self.dirs.extend((0, 0) for _ in range(16 - readable_dirs))
         self.sections = []
         table = opt + opt_size
         for i in range(sections):
@@ -187,11 +199,25 @@ class Image:
         return slots
 
 
+def _looks_like_float4(blob: bytes) -> bool:
+    """True when 16 bytes decode as four finite small/zero IEEE-754 float32 lanes (SIMD constant)."""
+    nonzero = 0
+    for u, f in zip(struct.unpack_from("<4I", blob), struct.unpack_from("<4f", blob)):
+        if u in (0, 0x80000000):
+            continue
+        if not math.isfinite(f) or not (1e-4 <= abs(f) <= 1e5):
+            return False
+        nonzero += 1
+    return nonzero >= 2
+
+
 def guid_shaped(blob: bytes) -> bool:
     """A plausible RFC-4122 GUID: version nibble 1-5, variant 10xx, and not all-zero/constant."""
     if len(blob) < 16 or blob[:4] == b"\0\0\0\0":
         return False
     if blob[:4] == b"DXBC":  # an embedded shader container, whose header hashes parse as GUID-shaped
+        return False
+    if _looks_like_float4(blob):  # SIMD float4 constants (e.g. 1.0f/1.5f) share version-3/4 nibbles
         return False
     version = blob[7] >> 4
     variant = blob[8] >> 6

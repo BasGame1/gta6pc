@@ -33,12 +33,13 @@ int main() {
     CHECK(list.uav_barrier({0}));
     CHECK(list.aliasing_barrier({0, 24}));
 
-    // Depth-stencil clears: at least one flag, no unknown flags, depth in [0, 1].
+    // Depth-stencil clears: no unknown flags. A clear that names no plane records nothing, and a depth outside [0, 1]
+    // is kept as given (WARP does that on a D32 target: d3d12_clear_test).
     const TargetView depth{48, 0, 0, 1};
-    CHECK(!list.clear_depth_stencil(depth, 0, 1.0f, 0));
+    CHECK(list.clear_depth_stencil(depth, 0, 1.0f, 0));
     CHECK(!list.clear_depth_stencil(depth, 0x4, 1.0f, 0));
-    CHECK(!list.clear_depth_stencil(depth, clear_depth, 1.5f, 0));
-    CHECK(!list.clear_depth_stencil(depth, clear_depth, -0.0001f, 0));
+    CHECK(list.clear_depth_stencil(depth, clear_depth, 1.5f, 0));
+    CHECK(list.clear_depth_stencil(depth, clear_depth, -0.0001f, 0));
     CHECK(!list.clear_depth_stencil({}, clear_depth, 1.0f, 0));
     CHECK(list.clear_depth_stencil(depth, clear_stencil, 7.0f, 0x5a));  // depth is ignored without clear_depth
     CHECK(list.clear_depth_stencil(depth, clear_depth | clear_stencil, 0.25f, 3));
@@ -51,7 +52,7 @@ int main() {
     CHECK(!list.uav_barrier({0}));
 
     const auto commands = list.commands();
-    CHECK(commands.size() == 7);
+    CHECK(commands.size() == 9);
     const auto* first = std::get_if<ClearRenderTarget>(&commands[0]);
     const auto* second = std::get_if<ClearRenderTarget>(&commands[1]);
     CHECK(first && second);
@@ -64,9 +65,13 @@ int main() {
     CHECK(transition->before == s::render_target && transition->after == s::copy_source);
     CHECK(std::get_if<UavBarrier>(&commands[3]) && std::get<UavBarrier>(commands[3]).resource == 0);
     CHECK(std::get_if<AliasingBarrier>(&commands[4]) && std::get<AliasingBarrier>(commands[4]).after == 24);
-    const auto* stencil = std::get_if<ClearDepthStencil>(&commands[5]);
+    const auto* oversized = std::get_if<ClearDepthStencil>(&commands[5]);
+    CHECK(oversized && oversized->depth == 1.5f);
+    const auto* negative = std::get_if<ClearDepthStencil>(&commands[6]);
+    CHECK(negative && negative->depth == -0.0001f);
+    const auto* stencil = std::get_if<ClearDepthStencil>(&commands[7]);
     CHECK(stencil && stencil->flags == clear_stencil && stencil->stencil == 0x5a);
-    const auto* both = std::get_if<ClearDepthStencil>(&commands[6]);
+    const auto* both = std::get_if<ClearDepthStencil>(&commands[8]);
     CHECK(both && both->flags == (clear_depth | clear_stencil) && both->depth == 0.25f && both->stencil == 3);
 
     // Rectangles are copied while recording.
@@ -94,15 +99,19 @@ int main() {
     CHECK(!list.barrier(BufferBarrier{y::copy, y::vertex_shading, a::copy_dest, a::vertex_buffer, 0}));
     CHECK(list.barrier(TextureBarrier{y::none, y::render_target, a::no_access, a::render_target, l::undefined,
                                       l::render_target, 9, all, texture_barrier_discard}));
-    CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::undefined, 9, all, 0}));
+    // Into UNDEFINED: the contents are no longer needed (WARP closes such a list, d3d12_close_parity_test).
+    CHECK(list.barrier(TextureBarrier{y::depth_stencil, y::none, a::depth_stencil_write, a::no_access,
+                                      l::depth_stencil_write, l::undefined, 9, all, 0}));
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9, all, 0x2}));
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9,
                                        {0, 1, 0, 0, 0, 1}, 0}));  // zero layers
     CHECK(list.close());
-    CHECK(list.commands().size() == 4);
+    CHECK(list.commands().size() == 5);
     CHECK(std::get<GlobalBarrier>(list.commands()[1]).sync_before == y::split);
     CHECK(std::get<BufferBarrier>(list.commands()[2]).resource == 7);
     CHECK(std::get<TextureBarrier>(list.commands()[3]).flags == texture_barrier_discard);
+    CHECK(std::get<TextureBarrier>(list.commands()[4]).layout_before == l::depth_stencil_write &&
+          std::get<TextureBarrier>(list.commands()[4]).layout_after == l::undefined);
 
     // Copies: D3D12's own call rules (aligned footprints; degenerate boxes and DEFAULT-heap
     // CopyResource self-copies are accepted as no-ops and must not record Vulkan commands).

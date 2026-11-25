@@ -1,7 +1,8 @@
-"""SPIR-V core and GLSL.std.450 grammar tables for tools/spirv_asm.py.
+"""SPIR-V core, GLSL.std.450 and NonSemantic.DebugPrintf grammar tables for tools/spirv_asm.py.
 
 Derived from Khronos Group SPIRV-Headers (MIT License):
-  spirv.core.grammar.json and extinst.glsl.std.450.grammar.json (unified1).
+  spirv.core.grammar.json, extinst.glsl.std.450.grammar.json and
+  extinst.nonsemantic.debugprintf.grammar.json (unified1).
 Grammar aliases have the entry of the name they stand for: instruction aliases such as
 OpDemoteToHelperInvocationEXT in INSTRUCTIONS, enumerant aliases in VALUE_ENUMS and BIT_ENUMS.
 spirv-as accepts either spelling.
@@ -1105,4 +1106,56 @@ GLSL_STD_450 = {
     'UnpackSnorm4x8': 63,
     'UnpackUnorm2x16': 61,
     'UnpackUnorm4x8': 64,
+}
+
+NONSEMANTIC_DEBUGPRINTF = {
+    'DebugPrintf': 1,
+}
+
+# extinst.nonsemantic.shader.debuginfo.100.grammar.json (SPIRV-Headers).
+NONSEMANTIC_SHADER_DEBUGINFO_100 = {
+    'DebugBuildIdentifier': 105,
+    'DebugCompilationUnit': 1,
+    'DebugDeclare': 28,
+    'DebugEntryPoint': 107,
+    'DebugExpression': 31,
+    'DebugFunction': 20,
+    'DebugFunctionDeclaration': 19,
+    'DebugFunctionDefinition': 101,
+    'DebugGlobalVariable': 18,
+    'DebugImportedEntity': 34,
+    'DebugInfoNone': 0,
+    'DebugInlinedAt': 25,
+    'DebugInlinedVariable': 27,
+    'DebugLexicalBlock': 21,
+    'DebugLexicalBlockDiscriminator': 22,
+    'DebugLine': 103,
+    'DebugLocalVariable': 26,
+    'DebugMacroDef': 32,
+    'DebugMacroUndef': 33,
+    'DebugNoLine': 104,
+    'DebugNoScope': 24,
+    'DebugOperation': 30,
+    'DebugScope': 23,
+    'DebugSource': 35,
+    'DebugSourceContinued': 102,
+    'DebugStoragePath': 106,
+    'DebugTypeArray': 5,
+    'DebugTypeBasic': 2,
+    'DebugTypeComposite': 10,
+    'DebugTypedef': 7,
+    'DebugTypeEnum': 9,
+    'DebugTypeFunction': 8,
+    'DebugTypeInheritance': 12,
+    'DebugTypeMatrix': 108,
+    'DebugTypeMember': 11,
+    'DebugTypePointer': 3,
+    'DebugTypePtrToMember': 13,
+    'DebugTypeQualifier': 4,
+    'DebugTypeTemplate': 14,
+    'DebugTypeTemplateParameter': 15,
+    'DebugTypeTemplateParameterPack': 17,
+    'DebugTypeTemplateTemplateParameter': 16,
+    'DebugTypeVector': 6,
+    'DebugValue': 29,
 }

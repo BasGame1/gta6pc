@@ -19,15 +19,15 @@ TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR", os.path.join(ROOT, "tools"))
 SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
-def make_bink(revision="n", frames=4, width=320, height=240, audio=0, body=256,
-              fps_num=30, fps_den=1):
-    extra = b"\x00\x05\xe9\x87" if revision in "ijkn" else b""
-    total = 0x2C + len(extra) + 4 * frames + body
-    header = bytearray(0x2C)
-    header[0:4] = b"KB2" + revision.encode()
-    struct.pack_into("<10I", header, 4, total - 8, frames, body, frames,
-                     width, height, fps_num, fps_den, 0x40013, audio)
-    return bytes(header) + extra + bytes(4 * frames) + bytes(body)
+def make_bink():
+    """A Bink 2 stream bink_index will accept: the header shape of tests/test_bink_index.py, with the
+    sentinel after it so the source is still recognisable as the file the tool must not replace.
+
+    bink_index checks a single named file's header before it indexes it (target_problem), because a wrong path
+    or a mislabelled file used to come back as a successful scan of 0 streams. The plain sentinel is neither a
+    KB2 stream nor an RPF archive, so the tool was right to refuse it: the fixture is what was wrong.
+    """
+    return struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4) + SENTINEL
 
 
 def make_rpf(payload, head_size=0x40):

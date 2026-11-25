@@ -9,7 +9,9 @@ driver (libdrm_amdgpu) by hw_oracle_drm.c. Standard library only. No ROCm: an as
                                   kernel driver reset the GPU, and with it everything shown on that display.
     LEONIDA_AMD_CLANG, LEONIDA_HOST_CC, LEONIDA_HW_ARCH   as in runner.py
 
-The launcher supports compute engine version 10 only: GFX10, which is RDNA1 and RDNA2.
+The launcher supports compute engine versions 10, 11 and 12: GFX10 (RDNA1 and RDNA2), GFX11 (RDNA3) and
+GFX12 (RDNA4). The registers the launcher writes sit at the same offsets on all three; only the preamble and
+the cu-mask writes differ, as hw_oracle_drm.c documents.
 """
 import glob
 import hashlib
@@ -49,8 +51,8 @@ def find_node(environ=None, sysfs="/sys/class/drm"):
     environ = os.environ if environ is None else environ
     node = environ.get("LEONIDA_HW_DRM_NODE")
     if not node:
-        raise Unavailable("set LEONIDA_HW_DRM_NODE to the render node of a GFX10 AMD GPU that drives no display "
-                          "(`ls -l /dev/dri/by-path` lists them)")
+        raise Unavailable("set LEONIDA_HW_DRM_NODE to the render node of a GFX10, GFX11 or GFX12 AMD GPU that "
+                          "drives no display (`ls -l /dev/dri/by-path` lists them)")
     if not os.path.exists(node):
         raise Unavailable(f"LEONIDA_HW_DRM_NODE={node} does not exist")
     displays = connected_displays(node, sysfs)
@@ -153,17 +155,23 @@ class DrmOracle(runner.Oracle):
         self.node = find_node()
         self.clang = runner.find_clang()
         self.chunk = chunk
+        owned = not workdir   # a temporary directory made here is removed if the constructor fails
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
-        self._offsets, self._registers = {}, {}
-        self.exe = self._build_launcher()
-        self.arch = arch or os.environ.get("LEONIDA_HW_ARCH") or self._device_arch()
         try:
-            asm.family(self.arch)
-        except ValueError as e:   # as in runner.Oracle: an architecture without spellings is a skip
-            raise Unavailable(f"{e} (set LEONIDA_HW_ARCH)") from None
-        self.device = self._probe()
-        if hasattr(self, "_probe_waves"):   # runner.Oracle has it once it runs kernels of both wave sizes
-            self._probe_waves()
+            self._offsets, self._registers = {}, {}
+            self.exe = self._build_launcher()
+            self.arch = arch or os.environ.get("LEONIDA_HW_ARCH") or self._device_arch()
+            try:
+                asm.family(self.arch)
+            except ValueError as e:   # as in runner.Oracle: an architecture without spellings is a skip
+                raise Unavailable(f"{e} (set LEONIDA_HW_ARCH)") from None
+            self.device = self._probe()
+            if hasattr(self, "_probe_waves"):   # runner.Oracle has it once it runs kernels of both wave sizes
+                self._probe_waves()
+        except BaseException:   # close() never runs for an object that was not built: remove the directory here
+            if owned:
+                shutil.rmtree(self.workdir, ignore_errors=True)
+            raise
 
     def _build_launcher(self):
         with open(SOURCE, "rb") as f:
@@ -193,7 +201,9 @@ class DrmOracle(runner.Oracle):
         if not head.startswith("#"):
             raise Unavailable((r.stderr.strip() or "the launcher printed no device line")[:300])
         arch = next((field[5:] for field in head.split() if field.startswith("arch=")), "")
-        return "gfx1030" if arch in ("", "gfx10xx") else arch   # every GFX10 chip takes the same encodings
+        # A chip the launcher could only label by generation (an unannounced revision): any member takes the
+        # same encodings, so a representative assembles for it. asm.family() groups the names the same way.
+        return {"": "gfx1030", "gfx10xx": "gfx1030", "gfx11xx": "gfx1100", "gfx12xx": "gfx1201"}.get(arch, arch)
 
     def _assemble(self, text, wave=32):
         s = os.path.join(self.workdir, "k.s")

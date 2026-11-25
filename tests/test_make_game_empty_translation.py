@@ -82,6 +82,32 @@ class TranslateEmptyIndexTest(unittest.TestCase):
         with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"shader_0": {"stage": "ps"}})
 
+    def test_a_failed_shard_removes_a_stale_index_and_skips_merge(self):
+        index = os.path.join(self.spirv, "index.json")
+        write(index, json.dumps({"old": {}}))
+        states = iter([None, 1])
+
+        class FailingShard(Done):
+            def poll(self):
+                return next(states, 1)
+
+            def wait(self):
+                return 1
+
+        err = io.StringIO()
+        merge_py = mock.Mock()
+        with mock.patch.object(make_game, "log", lambda *a: None), \
+                mock.patch.object(make_game, "py", merge_py), \
+                mock.patch.object(make_game.time, "sleep", lambda *a: None), \
+                mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: FailingShard()), \
+                mock.patch("sys.stderr", err), \
+                self.assertRaises(SystemExit) as cm:
+            make_game.translate(self.disasm, self.spirv, 1)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("rdna2spirv.py: shard 0 exited with 1.", err.getvalue())
+        self.assertFalse(os.path.exists(index))
+        merge_py.assert_not_called()
+
 
 class TranslateLockedIndexTest(unittest.TestCase):
     """translate(): an index that cannot be read or removed (on Windows, a file an antivirus scan or the indexer
@@ -115,6 +141,7 @@ class TranslateLockedIndexTest(unittest.TestCase):
                 return shard_code
 
         err = io.StringIO()
+        merge_py = mock.Mock()
         with mock.patch.object(make_game.os, "remove", remove), \
                 mock.patch("builtins.open", opener), \
                 mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: Exited()), \
@@ -122,10 +149,13 @@ class TranslateLockedIndexTest(unittest.TestCase):
                 self.assertRaises(SystemExit) as cm:
             if shard_code:
                 write(index, text)
-                with mock.patch.object(make_game, "log", lambda *a: None):
+                with mock.patch.object(make_game, "log", lambda *a: None), \
+                        mock.patch.object(make_game, "py", merge_py):
                     make_game.translate(self.disasm, self.spirv, 1)
             else:
                 self.translate_with_index(text)
+        if shard_code:
+            merge_py.assert_not_called()
         self.assertEqual(cm.exception.code, 1)
         message = err.getvalue()
         self.assertIn(f"{index} could not be removed (Permission denied): delete it before running", message)

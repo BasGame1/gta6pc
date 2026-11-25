@@ -8,10 +8,12 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "descriptor_table.h"
 #include "spirv_words.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +25,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -31,28 +34,66 @@ namespace leonida {
 // ---------------------------------------------------------------------------------------------------------------
 // zlib inflate
 
+// Why zlib_inflate failed, for a caller that reports the reason (runtime/shims/dstorage.cpp turns each into its
+// E_DSTORAGE_ZLIB_* code). `limit`: the output would pass the caller's limit; the stream was not read to its end.
+enum class ZlibError { none, header, data, checksum, limit };
+
 namespace detail {
 
 class BitReader {
 public:
     explicit BitReader(std::span<const std::uint8_t> in) : in_(in) {}
 
-    std::uint32_t bits(int need) {
-        std::uint64_t value = buffer_;
-        while (count_ < need) {
-            if (pos_ >= in_.size()) {
-                failed_ = true;
-                return 0;
+    // Refill up to 56..63 buffered bits without failing at EOF; bits >= count_ stay zero.
+    void fill() {
+        if constexpr (std::endian::native == std::endian::little) {
+            if (count_ < 56 && in_.size() - pos_ >= 8) {
+                std::uint64_t next;
+                std::memcpy(&next, in_.data() + pos_, 8);
+                const int take = (63 - count_) >> 3;
+                const int next_count = count_ | 56;
+                buffer_ = (buffer_ | (next << count_)) & ((std::uint64_t(1) << next_count) - 1);
+                pos_ += std::size_t(take);
+                count_ = next_count;
+                return;
             }
-            value |= std::uint64_t(in_[pos_++]) << count_;
+        }
+        while (count_ <= 55 && pos_ < in_.size()) {
+            buffer_ |= std::uint64_t(in_[pos_++]) << count_;
             count_ += 8;
         }
-        buffer_ = value >> need;
+    }
+
+    std::uint32_t bits(int need) {
+        if (count_ < need) {
+            fill();
+            if (count_ < need) {
+                failed_ = true;
+                buffer_ = 0;
+                count_ = 0;
+                return 0;
+            }
+        }
+        const std::uint32_t out = std::uint32_t(buffer_ & ((std::uint64_t(1) << need) - 1));
+        buffer_ >>= need;
         count_ -= need;
-        return std::uint32_t(value & ((std::uint64_t(1) << need) - 1));
+        return out;
+    }
+
+    std::uint64_t peek() const { return buffer_; }
+    int available() const { return count_; }
+    void drop(int n) {
+        buffer_ >>= n;
+        count_ -= n;
+    }
+    void fail() {
+        failed_ = true;
+        buffer_ = 0;
+        count_ = 0;
     }
 
     void align() {
+        pos_ -= std::size_t(count_ / 8);
         buffer_ = 0;
         count_ = 0;
     }
@@ -63,7 +104,7 @@ public:
         return true;
     }
 
-    std::size_t position() const { return pos_; }
+    std::size_t position() const { return pos_ - std::size_t(count_ / 8); }
     bool failed() const { return failed_; }
 
 private:
@@ -75,45 +116,112 @@ private:
 };
 
 struct Huffman {
+    static constexpr int kFastBits = 9;
+    static constexpr std::size_t kFastSize = std::size_t(1) << kFastBits;
+
     std::array<std::int16_t, 16> count{};
     std::array<std::int16_t, 288> symbol{};
+    int fast_bits = 0;
+    std::uint32_t fast_mask = 0;
+    // Direct lookup for canonical codes of length 1..fast_bits, indexed by LSB-first bits.
+    // Entry encoding: (symbol << 4) | length; 0 means length > fast_bits or an unassigned code.
+    std::array<std::uint16_t, kFastSize> fast{};
 };
 
 // Canonical Huffman table from code lengths. Returns false for an over-subscribed set.
 inline bool build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
+    static constexpr std::uint8_t kRev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
     h.count.fill(0);
-    for (int i = 0; i < n; ++i) ++h.count[lengths[i]];
-    if (h.count[0] == n) return true;  // no codes: valid only if never used
+    int max_len = 0;
+    for (int i = 0; i < n; ++i) {
+        const int len = lengths[i];
+        ++h.count[len];
+        if (len > max_len) max_len = len;
+    }
+    if (h.count[0] == n) {  // no codes: valid only if never used
+        h.fast_bits = 0;
+        h.fast_mask = 0;
+        h.fast[0] = 0;
+        return true;
+    }
     int left = 1;
     for (int len = 1; len < 16; ++len) {
         left <<= 1;
         left -= h.count[len];
-        if (left < 0) return false;
+        if (left < 0) {
+            h.fast_bits = 0;
+            h.fast_mask = 0;
+            h.fast[0] = 0;
+            return false;
+        }
     }
     std::array<std::int16_t, 16> offsets{};
     for (int len = 1; len < 15; ++len) offsets[len + 1] = std::int16_t(offsets[len] + h.count[len]);
     for (int i = 0; i < n; ++i)
         if (lengths[i]) h.symbol[offsets[lengths[i]]++] = std::int16_t(i);
+    const int fast_bits = max_len < Huffman::kFastBits ? max_len : Huffman::kFastBits;
+    const std::size_t fast_size = std::size_t(1) << fast_bits;
+    h.fast_bits = fast_bits;
+    h.fast_mask = std::uint32_t(fast_size - 1);
+    std::fill_n(h.fast.data(), fast_size, std::uint16_t(0));
+    int code = 0;
+    int idx = 0;
+    for (int len = 1; len <= fast_bits; ++len) {
+        const int c = h.count[len];
+        const std::size_t step = std::size_t(1) << len;
+        const int shift = Huffman::kFastBits - len;
+        for (int k = 0; k < c; ++k) {
+            const std::uint16_t sym = std::uint16_t(h.symbol[idx++]);
+            const std::uint16_t packed = std::uint16_t((sym << 4) | std::uint16_t(len));
+            const std::uint32_t v = std::uint32_t(code) << shift;
+            const std::uint32_t rev =
+                (std::uint32_t(kRev4[v & 15u]) << 5) | (std::uint32_t(kRev4[(v >> 4) & 15u]) << 1) | (v >> 8);
+            for (std::size_t slot = rev; slot < fast_size; slot += step) h.fast[slot] = packed;
+            ++code;
+        }
+        code <<= 1;
+    }
     return true;
 }
 
 inline int decode(BitReader& in, const Huffman& h) {
+    if (in.available() < h.fast_bits) in.fill();
+    const std::uint16_t entry = h.fast[in.peek() & h.fast_mask];
+    if (entry != 0) {
+        const int len = int(entry & 0x0fu);
+        if (len > in.available()) {
+            in.fail();
+            return -1;
+        }
+        in.drop(len);
+        return int(entry >> 4);
+    }
+    if (in.available() < 15) in.fill();
+    const int avail = in.available();
+    std::uint64_t bits = in.peek();
     int code = 0, first = 0, index = 0;
     for (int len = 1; len < 16; ++len) {
-        code |= int(in.bits(1));
+        if (len > avail) {
+            in.fail();
+            return -1;
+        }
+        code |= int(bits & 1u);
+        bits >>= 1;
         const int count = h.count[len];
-        if (code - count < first) return h.symbol[index + (code - first)];
+        if (code - count < first) {
+            in.drop(len);
+            return h.symbol[index + (code - first)];
+        }
         index += count;
         first += count;
         first <<= 1;
         code <<= 1;
-        if (in.failed()) return -1;
     }
     return -1;
 }
 
-inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
-                          const Huffman& distances, std::size_t limit) {
+inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
+                          const Huffman& distances, std::size_t limit, bool bulk = true) {
     static constexpr std::int16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                                      31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
     static constexpr std::int16_t length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
@@ -125,50 +233,79 @@ inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const H
                                                         6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
     for (;;) {
         int symbol = decode(in, lengths);
-        if (symbol < 0 || in.failed()) return false;
+        if (symbol < 0 || in.failed()) return ZlibError::data;
         if (symbol < 256) {
-            if (out.size() >= limit) return false;
+            if (out.size() >= limit) return ZlibError::limit;
             out.push_back(std::uint8_t(symbol));
             continue;
         }
-        if (symbol == 256) return true;
+        if (symbol == 256) return ZlibError::none;
         symbol -= 257;
-        if (symbol >= 29) return false;
+        if (symbol >= 29) return ZlibError::data;
         const std::size_t length = std::size_t(length_base[symbol]) + in.bits(length_extra[symbol]);
         const int d = decode(in, distances);
-        if (d < 0 || d >= 30) return false;
+        if (d < 0 || d >= 30) return ZlibError::data;
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
-        if (in.failed() || distance > out.size() || out.size() + length > limit) return false;
-        const std::size_t from = out.size() - distance;
-        for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+        if (in.failed() || distance > out.size()) return ZlibError::data;
+        if (out.size() > limit || length > limit - out.size()) return ZlibError::limit;
+        const std::size_t start = out.size();
+        if (!bulk) {
+            for (std::size_t i = 0; i < length; ++i) out.push_back(out[start - distance + i]);
+            continue;
+        }
+        out.resize(start + length);
+        auto* dest = out.data() + start;
+        if (distance == 1) {
+            std::fill_n(dest, length, dest[-1]);
+        } else {
+            // Overlapping matches repeat their first distance bytes. Each copy reads only completed output.
+            std::size_t copied = std::min(distance, length);
+            std::memcpy(dest, dest - distance, copied);
+            while (copied < length) {
+                const auto count = std::min(copied, length - copied);
+                std::memcpy(dest + copied, dest, count);
+                copied += count;
+            }
+        }
     }
 }
 
 } // namespace detail
 
 // Inflates a zlib stream (RFC 1950: header, deflate data, Adler-32). Returns false for a malformed stream, a
-// preset dictionary, a checksum mismatch, or output beyond `limit` bytes.
+// preset dictionary, a checksum mismatch, or output beyond `limit` bytes, and then stores the reason in `*why` when
+// it is given: `header` for the two header bytes (not deflate, a window over 32 KiB, a bad check value, a preset
+// dictionary), `data` for the deflate data or a missing trailer, `checksum` for an Adler-32 mismatch, `limit` for
+// output beyond `limit`. Bytes after the Adler-32 trailer are not read.
 inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint8_t>& out,
-                         std::size_t limit = std::size_t(1) << 30) {
+                         std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr, bool bulk = true) {
     out.clear();
-    if (in.size() < 6) return false;
+    const auto fail = [why](ZlibError reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    if (why) *why = ZlibError::none;
+    if (in.size() < 2) return fail(ZlibError::header);
     const unsigned cmf = in[0], flg = in[1];
-    if ((cmf & 0x0f) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 || (flg & 0x20)) return false;
+    if ((cmf & 0x0f) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 || (flg & 0x20))
+        return fail(ZlibError::header);
+    if (in.size() < 6) return fail(ZlibError::data);
     detail::BitReader reader(in.subspan(2));
     for (bool last = false; !last;) {
         last = reader.bits(1) != 0;
         const std::uint32_t type = reader.bits(2);
-        if (reader.failed()) return false;
+        if (reader.failed()) return fail(ZlibError::data);
         if (type == 0) {  // stored
             reader.align();
             std::uint8_t b[4];
             for (auto& x : b)
-                if (!reader.byte(x)) return false;
+                if (!reader.byte(x)) return fail(ZlibError::data);
             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
-            if (length != (~complement & 0xffff) || out.size() + length > limit) return false;
+            if (length != (~complement & 0xffff)) return fail(ZlibError::data);
+            if (out.size() > limit || length > limit - out.size()) return fail(ZlibError::limit);
             for (unsigned i = 0; i < length; ++i) {
                 std::uint8_t x;
-                if (!reader.byte(x)) return false;
+                if (!reader.byte(x)) return fail(ZlibError::data);
                 out.push_back(x);
             }
         } else if (type == 1) {  // fixed Huffman
@@ -184,19 +321,20 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 detail::build_huffman(t.second, lengths, 30);
                 return t;
             }();
-            if (!detail::inflate_codes(reader, out, tables.first, tables.second, limit)) return false;
+            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit, bulk); e != ZlibError::none)
+                return fail(e);
         } else if (type == 2) {  // dynamic Huffman
             const int literal_count = int(reader.bits(5)) + 257, distance_count = int(reader.bits(5)) + 1;
             const int code_count = int(reader.bits(4)) + 4;
-            if (literal_count > 286 || distance_count > 30) return false;
+            if (literal_count > 286 || distance_count > 30) return fail(ZlibError::data);
             static constexpr int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
             std::int16_t lengths[320] = {};
             for (int i = 0; i < code_count; ++i) lengths[order[i]] = std::int16_t(reader.bits(3));
             detail::Huffman code_lengths;
-            if (!detail::build_huffman(code_lengths, lengths, 19)) return false;
+            if (!detail::build_huffman(code_lengths, lengths, 19)) return fail(ZlibError::data);
             for (int i = 0; i < literal_count + distance_count;) {
                 const int symbol = detail::decode(reader, code_lengths);
-                if (symbol < 0) return false;
+                if (symbol < 0) return fail(ZlibError::data);
                 if (symbol < 16) {
                     lengths[i++] = std::int16_t(symbol);
                     continue;
@@ -204,7 +342,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 std::int16_t value = 0;
                 int repeat;
                 if (symbol == 16) {
-                    if (i == 0) return false;
+                    if (i == 0) return fail(ZlibError::data);
                     value = lengths[i - 1];
                     repeat = 3 + int(reader.bits(2));
                 } else if (symbol == 17) {
@@ -212,31 +350,46 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 } else {
                     repeat = 11 + int(reader.bits(7));
                 }
-                if (i + repeat > literal_count + distance_count) return false;
+                if (i + repeat > literal_count + distance_count) return fail(ZlibError::data);
                 while (repeat--) lengths[i++] = value;
             }
-            if (lengths[256] == 0) return false;  // no end-of-block code
+            if (lengths[256] == 0) return fail(ZlibError::data);  // no end-of-block code
             detail::Huffman literal, distance;
             if (!detail::build_huffman(literal, lengths, literal_count) ||
                 !detail::build_huffman(distance, lengths + literal_count, distance_count))
-                return false;
-            if (!detail::inflate_codes(reader, out, literal, distance, limit)) return false;
+                return fail(ZlibError::data);
+            if (const ZlibError e = detail::inflate_codes(reader, out, literal, distance, limit, bulk); e != ZlibError::none)
+                return fail(e);
         } else {
-            return false;
+            return fail(ZlibError::data);
         }
-        if (reader.failed()) return false;
+        if (reader.failed()) return fail(ZlibError::data);
     }
     // Adler-32, big-endian, after the deflate data's last whole byte.
     const std::size_t at = 2 + reader.position();
-    if (at + 4 > in.size()) return false;
+    if (at > in.size() || in.size() - at < 4) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
-    for (const std::uint8_t x : out) {
-        a = (a + x) % 65521;
-        b = (b + a) % 65521;
+    if (bulk) {
+        // At most 5,552 bytes of 0xff fit in both 32-bit accumulators between reductions.
+        for (std::span<const std::uint8_t> tail(out); !tail.empty();) {
+            const auto block = tail.first(std::min<std::size_t>(tail.size(), 5552));
+            for (const auto x : block) {
+                a += x;
+                b += a;
+            }
+            a %= 65521;
+            b %= 65521;
+            tail = tail.subspan(block.size());
+        }
+    } else {
+        for (const std::uint8_t x : out) {
+            a = (a + x) % 65521;
+            b = (b + a) % 65521;
+        }
     }
     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];
-    return ((b << 16) | a) == expected;
+    return ((b << 16) | a) == expected || fail(ZlibError::checksum);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -687,7 +840,8 @@ struct SignatureElement {
 
 struct ShaderEntry {
     std::string name;
-    std::string stage;  // "vs", "ps", "cs", "ms", "gs"
+    std::string spv_file;  // optional "<prefix><spv>" filename when the index key is a hash
+    std::string stage;     // "vs", "ps", "cs", "ms", "gs"
     std::string fssm_sha256;
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
@@ -698,6 +852,7 @@ struct ShaderEntry {
     // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
     std::uint32_t lds_bytes = 0;
     bool uses_code_base = false;
+    bool code_base_known = false;
     bool wave64 = false;
     // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
     // as one translated with --wave64-emulate does, or has none.
@@ -705,7 +860,14 @@ struct ShaderEntry {
     // "workgroup" for a shader translated with --wave64-emulate: it uses no subgroup operation and is exact on any
     // subgroup size. Empty for a native translation.
     std::string wave64_exchange;
-    bool emulated() const { return !wave64_exchange.empty(); }
+    // Wave64 VS/PS/GS only: the translator's partition-invariance tier (index.json `wave64_graphics`; docs/design.md,
+    // "Wave64 graphics"). A and B are exact when the wave is cut into two 32-lane halves, C is not. Empty for other
+    // stages or an index written without the analysis.
+    std::string wave64_graphics;
+    bool emulated() const { return wave64_exchange == "workgroup"; }
+    // Mesh shaders: the index's "root_window" is {"sgpr": 16, "dword": 8}, so the module reads its root arguments
+    // from the graphics window (push dword 8 = root dword 0, D3D-448 follow-up). False for one translated before it.
+    bool graphics_root_window = false;
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
@@ -720,28 +882,98 @@ struct ShaderEntry {
     std::uint32_t max_primitives = 0;
 };
 
+// Which descriptor-table hash finalizer the loaded modules probe with (descriptor_table.h). Each module's index.json
+// meta may carry `"descriptor_hash": "fnv1a_fmix32"`; an absent key means the old bare `"fnv1a"`. The runtime has one
+// table for all shaders, so it counts the kinds over every loaded module (the root index and each sub-index) and picks
+// the majority; a mixed library still works, because the minority's lookups simply miss to index 0.
+struct DescriptorHashCensus {
+    std::size_t fnv1a = 0;
+    std::size_t fnv1a_fmix32 = 0;
+    std::size_t total() const { return fnv1a + fnv1a_fmix32; }
+};
+
+// The kind most modules declare. A tie (or no modules) is fnv1a, the behaviour before the marker existed.
+inline DescriptorHashKind majority_descriptor_hash_kind(const DescriptorHashCensus& census) {
+    return census.fnv1a_fmix32 > census.fnv1a ? DescriptorHashKind::fnv1a_fmix32 : DescriptorHashKind::fnv1a;
+}
+
+// LEONIDA_DESCRIPTOR_HASH=fnv1a|fnv1a_fmix32 overrides the modules' majority. False when `value` is null, empty or not
+// one of the two kinds (an unrecognised value is ignored rather than failing startup).
+inline bool descriptor_hash_kind_from_env(const char* value, DescriptorHashKind* kind) {
+    if (!value || !*value) return false;
+    if (std::strcmp(value, "fnv1a_fmix32") == 0) {
+        if (kind) *kind = DescriptorHashKind::fnv1a_fmix32;
+        return true;
+    }
+    if (std::strcmp(value, "fnv1a") == 0) {
+        if (kind) *kind = DescriptorHashKind::fnv1a;
+        return true;
+    }
+    return false;
+}
+
 class ShaderLibrary {
 public:
-    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
-    // when it is there:
+    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs and the
+    // game executable, each when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
+    //   - <dir>/fspx_compute/index.json, the compute programs from shaders.rpf's pipeline library;
+    //   - <dir>/fspx_gfx/index.json, the graphics programs from the same library;
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
     //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
-    //   - <dir>/exe/index.json, game_scarlett_master.exe's embedded FSSM programs (docs/embedded_shaders.md).
-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Optional
-    // folders: a missing or unreadable index there leaves the main one, and the other folders', loaded.
+    //   - <dir>/exe/index.json, game_scarlett_master.exe's own DXBC containers, entries named "exe/<name>" and found
+    //     the same way (docs/embedded_shaders.md, "Retail executable");
+    //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
+    //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
+    //     like the FSPX ones (docs/shader_library.md).
+    // fspx_compute/ and library/ are two builds of the same slot-67 programs (make_game.py's library_shaders() writes
+    // library/; fspx_compute/ is the set translated from every console-path miss): both go into the same FSPX lookup
+    // by kind-6 and kind-0 SHA-256, and fspx_compute/ is read first, so its entry is the one found when both hold a
+    // program. Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The
+    // sub-indexes are optional: a missing or unreadable index there leaves the main one and the other folders loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
             return false;
         };
         // Nothing here may throw into the D3D12 shim (only allocation can, and that is caught too).
+        std::filesystem::path folder;
         try {
-            if (!load_index(dir, "", fail)) return false;
+            // The modules are read when a pipeline needs them, later than this. A relative folder would follow the
+            // current directory, which the title may change (SetCurrentDirectory), so it is fixed here once.
+            std::error_code ec;
+            folder = std::filesystem::absolute(dir, ec);
+            if (ec) folder = dir;
+            if (!load_index(folder, "", fail)) return false;
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "bvh", "exe"}) {
+        for (const char* sub_folder : {"fspx", "fspx_compute", "fspx_gfx", "bvh", "exe", "library"}) {
+            try {
+                const auto ignore = [](const std::string&) { return false; };
+                const std::filesystem::path sub = folder / sub_folder;
+                if (std::ifstream(sub / "index.json", std::ios::binary))
+                    load_index(sub, std::string(sub_folder) + "/", ignore);
+            } catch (...) {
+            }
+        }
+        return true;
+    }
+
+    // Loads only the optional FSPX sub-indexes (<dir>/fspx/index.json and <dir>/fspx_gfx/index.json) without parsing
+    // the 26,565-entry main index.json, for fast stage/hash lookups in the Xbox device proxy.
+    bool load_fspx_only(const std::filesystem::path& dir) {
+        dir_ = dir;
+        entries_.clear();
+        fspx_entries_.clear();
+        count_ = 0;
+        fspx_count_ = 0;
+        fspx_compute_count_ = 0;
+        fspx_gfx_count_ = 0;
+        bvh_count_ = 0;
+        exe_count_ = 0;
+        descriptor_hash_census_ = {};
+        for (const char* folder : {"fspx", "fspx_gfx"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;
@@ -750,18 +982,30 @@ public:
             } catch (...) {
             }
         }
-        return true;
+        return (fspx_count_ + fspx_gfx_count_) > 0;
     }
 
     bool loaded() const { return !dir_.empty(); }
+    // The folder load() read, made absolute; empty before.
+    const std::filesystem::path& directory() const { return dir_; }
     std::size_t size() const { return count_; }
-    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
-    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    // The descriptor-hash kinds the loaded modules declare, and the kind the majority of them probe with (fnv1a when
+    // they tie or none declares one). The device takes this once, before its descriptor table's first insert, unless
+    // LEONIDA_DESCRIPTOR_HASH names a kind.
+    const DescriptorHashCensus& descriptor_hash_census() const { return descriptor_hash_census_; }
+    DescriptorHashKind descriptor_hash_kind() const { return majority_descriptor_hash_kind(descriptor_hash_census_); }
+    // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
+    // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
+    // entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
+    std::size_t fspx_compute_size() const { return fspx_compute_count_; }
+    // Entries loaded from <dir>/fspx_gfx/index.json (graphics FSPX programs from shaders.rpf's pipeline library).
+    std::size_t fspx_gfx_size() const { return fspx_gfx_count_; }
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
     std::size_t bvh_size() const { return bvh_count_; }
-    // Entries loaded from <dir>/exe/index.json (game_scarlett_master.exe embedded containers).
+    // Entries loaded from <dir>/exe/index.json: game_scarlett_master.exe's inline containers, which no shader
+    // archive holds.
     std::size_t exe_size() const { return exe_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
@@ -780,14 +1024,22 @@ public:
         return lookup(fspx_entries_, stage, fspx_code_sha256);
     }
 
+    // Finds an FSPX program by its kind-6 SHA-256 across all stages so the stage comes from the index entry itself.
+    const ShaderEntry* find_fspx_by_code(std::string_view fspx_code_sha256) const {
+        for (std::string_view st : {"vs", "ps", "ms", "gs", "cs"}) {
+            const auto all = fspx_candidates(st, fspx_code_sha256);
+            if (!all.empty()) return all.front();
+        }
+        return nullptr;
+    }
+
     // The entries for a program compute_program() found, by the key of its kind (docs/fspx.md, "Build and run-time
     // lookup"):
     //   - FSSM: by fssm_sha256, as before;
     //   - FSPX with its kind-0 entry (a container or a bare payload): by fspx_code_sha256, then only the entries
     //     whose fspx_state_sha256 is the SHA-256 of that kind-0 entry;
     //   - a bare kind-6 program, which comes without kind 0: by fspx_code_sha256 when all those entries have the
-    //     same module; when their modules differ the program is ambiguous, the result is empty and `ambiguous` is
-    //     set, instead of picking one of them.
+    //     same module and runtime metadata; otherwise the program is ambiguous and the result is empty.
     std::vector<const ShaderEntry*> program_candidates(std::string_view stage, const ComputeProgram& program,
                                                        bool* ambiguous = nullptr) const {
         if (ambiguous) *ambiguous = false;
@@ -802,8 +1054,13 @@ public:
         }
         if (all.size() > 1) {
             const auto first = spirv(*all.front());
+            const auto runtime_metadata = [](const ShaderEntry& e) {
+                return std::tie(e.binding_count, e.push_constant_bytes, e.local_size, e.lds_bytes, e.uses_code_base,
+                                e.wave64, e.subgroup_size, e.wave64_exchange, e.literal_samplers);
+            };
             for (std::size_t i = 1; i < all.size(); ++i) {
-                if (first.empty() || spirv(*all[i]) != first) {
+                if (first.empty() || runtime_metadata(*all[i]) != runtime_metadata(*all.front()) ||
+                    spirv(*all[i]) != first) {
                     if (ambiguous) *ambiguous = true;
                     return {};
                 }
@@ -812,11 +1069,30 @@ public:
         return all;
     }
 
+    // The size of the module's file in bytes, or 0 when it is missing: what spirv() would read, without reading it.
+    std::size_t spirv_bytes(const ShaderEntry& entry) const {
+        std::error_code ec;
+        auto path = dir_;
+        path += "/" + entry.name + ".spv";
+        auto size = std::filesystem::file_size(path, ec);
+        if (ec && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            size = std::filesystem::file_size(alt, ec);
+        }
+        return ec ? 0 : static_cast<std::size_t>(size);
+    }
+
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
         auto path = dir_;
         path += "/" + entry.name + ".spv";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            file.open(alt, std::ios::binary | std::ios::ate);
+        }
         return read_spirv_words(file, file.tellg());
     }
 
@@ -865,8 +1141,11 @@ private:
             fspx_entries_.clear();
             count_ = 0;
             fspx_count_ = 0;
+            fspx_compute_count_ = 0;
+            fspx_gfx_count_ = 0;
             bvh_count_ = 0;
             exe_count_ = 0;
+            descriptor_hash_census_ = {};
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -877,6 +1156,8 @@ private:
             if ((!by_fssm && !by_fspx) || !stage || stage->kind != Json::Kind::string) continue;
             ShaderEntry e;
             e.name = prefix + name;
+            if (const Json* spv = meta.find("spv"); spv && spv->kind == Json::Kind::string && !spv->string.empty())
+                e.spv_file = prefix + spv->string;
             e.stage = stage->string;
             if (by_fssm) e.fssm_sha256 = hash->string;
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
@@ -887,12 +1168,26 @@ private:
             e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
-            if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
+            // The paired FSPX translator emits uses_code_base only when true. Older
+            // key-only indexes have no such contract; retain their program bytes.
+            e.code_base_known = !e.fspx_state_sha256.empty();
+            if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) {
+                e.uses_code_base = c->boolean;
+                e.code_base_known = true;
+            }
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
             if (const Json* g = meta.find("subgroup_size"); g && g->kind == Json::Kind::number)
                 e.subgroup_size = u32(g);
             if (const Json* x = meta.find("wave64_exchange"); x && x->kind == Json::Kind::string)
                 e.wave64_exchange = x->string;
+            if (const Json* r = meta.find("root_window"); r && r->kind == Json::Kind::object) {
+                const Json* sgpr = r->find("sgpr");
+                const Json* dword = r->find("dword");
+                e.graphics_root_window = sgpr && dword && sgpr->kind == Json::Kind::number &&
+                                         dword->kind == Json::Kind::number && u32(sgpr) == 16 && u32(dword) == 8;
+            }
+            if (const Json* wg = meta.find("wave64_graphics"); wg && wg->kind == Json::Kind::string)
+                e.wave64_graphics = wg->string;
             if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
                 for (const Json& item : s->array) {
                     SignatureElement element;
@@ -912,9 +1207,20 @@ private:
             if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
                 for (const auto& [key, val] : fh->object) {
                     if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
-                    char* end = nullptr;
-                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
-                    if (!end || *end != '\0') continue;
+                    std::uint64_t param = 0;
+                    bool ok = true;
+                    for (const char c : key) {
+                        if (c < '0' || c > '9') {
+                            ok = false;
+                            break;
+                        }
+                        param = param * 10u + std::uint64_t(c - '0');
+                        if (param > UINT32_MAX) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
                 }
             }
@@ -928,9 +1234,18 @@ private:
             }
             e.max_vertices = u32(meta.find("max_vertices"));
             e.max_primitives = u32(meta.find("max_primitives"));
+            // Which finalizer this module's shader probes the descriptor table with (descriptor_table.h). Absent, or not
+            // a kind this runtime knows, is the old bare FNV-1a.
+            if (const Json* dh = meta.find("descriptor_hash");
+                dh && dh->kind == Json::Kind::string && dh->string == "fnv1a_fmix32")
+                ++descriptor_hash_census_.fnv1a_fmix32;
+            else
+                ++descriptor_hash_census_.fnv1a;
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
-            if (by_fspx && prefix == "fspx/") ++fspx_count_;
+            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
+            if (by_fspx && prefix == "fspx_compute/") ++fspx_compute_count_;
+            if (by_fspx && prefix == "fspx_gfx/") ++fspx_gfx_count_;
             if (prefix == "bvh/") ++bvh_count_;
             if (prefix == "exe/") ++exe_count_;
             ++count_;
@@ -941,11 +1256,14 @@ private:
     std::filesystem::path dir_;
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
+    std::size_t fspx_compute_count_ = 0;
+    std::size_t fspx_gfx_count_ = 0;
     std::size_t bvh_count_ = 0;
     std::size_t exe_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;
+    DescriptorHashCensus descriptor_hash_census_;
 };
 
 } // namespace leonida

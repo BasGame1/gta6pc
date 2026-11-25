@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,10 +47,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gameinput.h"
 #include "gameinput_abi.h"
+#include "gameinput_script.h"
 #include "shims.h"
 
 using namespace gi;
@@ -130,14 +133,30 @@ const rt::gameinput::HapticApi& haptics() { return *g_haptic_api.load(); }
 
 // ---- configuration ----------------------------------------------------------------------------------------------
 
-std::string env(const char* name) {
-    char buf[64];
-    const DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
-    if (n == 0 || n >= sizeof buf) return {};
-    std::string s(buf, n);
-    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
+std::string env(const char* name) { return rt::gameinput::script::env_lower(name); }
+
+// The script's button numbers are SDL's (gameinput_script.h shares them with the shim built without SDL3).
+constexpr bool script_buttons_match_sdl() {
+    const struct {
+        uint32_t bit;
+        SDL_GamepadButton sdl;
+    } expected[] = {{GameInputGamepadA, SDL_GAMEPAD_BUTTON_SOUTH},          {GameInputGamepadB, SDL_GAMEPAD_BUTTON_EAST},
+                    {GameInputGamepadX, SDL_GAMEPAD_BUTTON_WEST},           {GameInputGamepadY, SDL_GAMEPAD_BUTTON_NORTH},
+                    {GameInputGamepadMenu, SDL_GAMEPAD_BUTTON_START},       {GameInputGamepadView, SDL_GAMEPAD_BUTTON_BACK},
+                    {GameInputGamepadLeftShoulder, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+                    {GameInputGamepadRightShoulder, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+                    {GameInputGamepadDPadUp, SDL_GAMEPAD_BUTTON_DPAD_UP},   {GameInputGamepadDPadDown, SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+                    {GameInputGamepadDPadLeft, SDL_GAMEPAD_BUTTON_DPAD_LEFT},
+                    {GameInputGamepadDPadRight, SDL_GAMEPAD_BUTTON_DPAD_RIGHT}};
+    if (std::size(expected) != std::size(rt::gameinput::script::kButtons)) return false;
+    for (const auto& e : expected) {
+        bool found = false;
+        for (const auto& b : rt::gameinput::script::kButtons) found |= b.bit == e.bit && b.sdl == e.sdl;
+        if (!found) return false;
+    }
+    return true;
 }
+static_assert(script_buttons_match_sdl(), "gameinput_script.h's SDL button numbers drifted from SDL_GamepadButton");
 
 rt::gameinput::Config read_config() {
     rt::gameinput::Config c;
@@ -442,6 +461,22 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
     return true;
 }
 
+struct TriggerWaveform {
+    float intensity = 0.0f;
+    uint64_t start = 0, end = 0;  // microseconds, end == 0 holds until replaced
+    uint64_t duration = 0, delay = 0;
+
+    float level_at(uint64_t now) const {
+        if (end && now >= end) return 0.0f;
+        if (!duration || !delay || now <= start) return intensity;
+        const uint64_t elapsed = now - start;
+        if (elapsed < duration) return intensity;
+        // A cycle longer than the clock's entire range can only reach its first quiet interval.
+        if (delay > UINT64_MAX - duration) return 0.0f;
+        return elapsed % (duration + delay) < duration ? intensity : 0.0f;
+    }
+};
+
 class Device final : public IGameInputDevice {
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -507,8 +542,7 @@ public:
     float motor_gain = 1.0f;                     // SetForceFeedbackMotorGain, 0..1
     std::vector<ForceFeedbackEffect*> effects;    // every live effect, so the poll thread can drive them
     std::vector<int> retired;                     // SDL effect ids whose object is gone: destroyed on the poll thread
-    float haptic_intensity[kHapticMotors] = {};   // SetHapticMotorState, 0..1
-    uint64_t haptic_until[kHapticMotors] = {};    // when the request ends, 0 for "until changed"
+    TriggerWaveform waveforms[kHapticMotors]{};
     GameInputBatteryState battery{0, 0, 0, 0, GameInputBatteryUnknown};
     AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
 
@@ -1082,30 +1116,7 @@ Snapshot read_pad(Device* d) {
         }
     }
 
-    // UI navigation derived from the gamepad (VERIFY against the console's own mapping).
-    const uint32_t b = s.gamepad.buttons;
-    const float t = 0.5f;
-    uint32_t& u = s.ui;
-    if (b & GameInputGamepadMenu) u |= GameInputUiNavigationMenu;
-    if (b & GameInputGamepadView) u |= GameInputUiNavigationView;
-    if (b & GameInputGamepadA) u |= GameInputUiNavigationAccept;
-    if (b & GameInputGamepadB) u |= GameInputUiNavigationCancel;
-    if (b & GameInputGamepadX) u |= GameInputUiNavigationContext1;
-    if (b & GameInputGamepadY) u |= GameInputUiNavigationContext2;
-    if (b & GameInputGamepadLeftThumbstick) u |= GameInputUiNavigationContext3;
-    if (b & GameInputGamepadRightThumbstick) u |= GameInputUiNavigationContext4;
-    if ((b & GameInputGamepadDPadUp) || s.gamepad.leftThumbstickY > t) u |= GameInputUiNavigationUp;
-    if ((b & GameInputGamepadDPadDown) || s.gamepad.leftThumbstickY < -t) u |= GameInputUiNavigationDown;
-    if ((b & GameInputGamepadDPadLeft) || s.gamepad.leftThumbstickX < -t) u |= GameInputUiNavigationLeft;
-    if ((b & GameInputGamepadDPadRight) || s.gamepad.leftThumbstickX > t) u |= GameInputUiNavigationRight;
-    if (b & GameInputGamepadLeftShoulder) u |= GameInputUiNavigationPageLeft;
-    if (b & GameInputGamepadRightShoulder) u |= GameInputUiNavigationPageRight;
-    if (s.gamepad.leftTrigger > t) u |= GameInputUiNavigationPageUp;
-    if (s.gamepad.rightTrigger > t) u |= GameInputUiNavigationPageDown;
-    if (s.gamepad.rightThumbstickY > t) u |= GameInputUiNavigationScrollUp;
-    if (s.gamepad.rightThumbstickY < -t) u |= GameInputUiNavigationScrollDown;
-    if (s.gamepad.rightThumbstickX < -t) u |= GameInputUiNavigationScrollLeft;
-    if (s.gamepad.rightThumbstickX > t) u |= GameInputUiNavigationScrollRight;
+    s.ui = rt::gameinput::script::ui_navigation(s.gamepad);
     return s;
 }
 
@@ -1180,7 +1191,40 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
         d->button_info[b].mappedInputKinds = GameInputKindGamepad;
         d->button_info[b].legacyHidIndex = static_cast<uint16_t>(b);
         d->button_info[b].legacyDInputIndex = static_cast<uint16_t>(b);
+        d->button_info[b].label = GameInputLabelUnknown;  // paddles, touchpad, misc: no gamepad meaning to name
     }
+    // Labels. Every pad is presented as an Xbox One pad (docs/gameinput.md), so every control carries the Xbox label
+    // of its position, whatever is printed on the pad in the player's hands. A stick axis has no label in v0, so
+    // only the triggers are named. UI navigation names the controls read_pad reads it from; scrolling is the right
+    // stick, which has none.
+    const GameInputLabel face[4] = {GameInputLabelXboxA, GameInputLabelXboxB, GameInputLabelXboxX,
+                                    GameInputLabelXboxY};
+    const GameInputLabel menu = GameInputLabelXboxMenu, view = GameInputLabelXboxView;
+    const GameInputLabel up = GameInputLabelXboxDPadUp, down = GameInputLabelXboxDPadDown;
+    const GameInputLabel left = GameInputLabelXboxDPadLeft, right = GameInputLabelXboxDPadRight;
+    const GameInputLabel lb = GameInputLabelXboxLeftShoulder, rb = GameInputLabelXboxRightShoulder;
+    const GameInputLabel ls = GameInputLabelXboxLeftStickButton, rs = GameInputLabelXboxRightStickButton;
+    const GameInputLabel lt = GameInputLabelXboxLeftTrigger, rt = GameInputLabelXboxRightTrigger;
+    const GameInputLabel none = GameInputLabelNone;
+    d->gamepad_info = {menu, view, face[0], face[1], face[2], face[3], up, down, left, right, lb, rb, ls, rs};
+    d->ui_info = {menu, view, face[0], face[1], up, down, left, right, face[2], face[3], ls, rs, lt, rt, lb, rb,
+                  none, none, none, none, GameInputLabelXboxGuide};
+    d->axis_info[4].label = lt;
+    d->axis_info[5].label = rt;
+    const struct {
+        SDL_GamepadButton sdl;
+        GameInputLabel label;
+    } labelled[] = {
+        {SDL_GAMEPAD_BUTTON_SOUTH, face[0]},    {SDL_GAMEPAD_BUTTON_EAST, face[1]},
+        {SDL_GAMEPAD_BUTTON_WEST, face[2]},     {SDL_GAMEPAD_BUTTON_NORTH, face[3]},
+        {SDL_GAMEPAD_BUTTON_BACK, view},        {SDL_GAMEPAD_BUTTON_GUIDE, GameInputLabelXboxGuide},
+        {SDL_GAMEPAD_BUTTON_START, menu},       {SDL_GAMEPAD_BUTTON_LEFT_STICK, ls},
+        {SDL_GAMEPAD_BUTTON_RIGHT_STICK, rs},   {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, lb},
+        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, rb}, {SDL_GAMEPAD_BUTTON_DPAD_UP, up},
+        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, down},   {SDL_GAMEPAD_BUTTON_DPAD_LEFT, left},
+        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, right},
+    };
+    for (const auto& l : labelled) d->button_info[l.sdl].label = l.label;
     i.controllerAxisInfo = d->axis_info;
     i.controllerButtonInfo = d->button_info;
     i.gamepadInfo = &d->gamepad_info;
@@ -1386,7 +1430,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->haptic_motors = 0;
     if (d->has_trigger_output) {
         for (uint32_t m = 0; m < kHapticMotors; ++m) {
-            d->haptic_waveform_info[m] = {{0x0F, 0x58}, true, true, true, false, 0};
+            d->haptic_waveform_info[m] = {{0x0F, 0x58}, true, true, true, true, 0};
             d->haptic_motor_info[m] = {};
             d->haptic_motor_info[m].mappedRumbleMotors = m ? GameInputRumbleRightTrigger : GameInputRumbleLeftTrigger;
             d->haptic_motor_info[m].location = GameInputLocationChassis;
@@ -1456,7 +1500,7 @@ void close_pad(Device* d, uint64_t ts) {
     d->sent_gain = -1;
     d->haptic_motors = 0;
     for (ForceFeedbackEffect* e : d->effects) e->orphan();
-    for (uint32_t m = 0; m < kHapticMotors; ++m) d->haptic_intensity[m] = 0, d->haptic_until[m] = 0;
+    for (auto& waveform : d->waveforms) waveform = {};
     if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
     for (Reading* r : d->history) r->Release();
     d->history.clear();
@@ -1525,7 +1569,7 @@ void apply_output(Device* d, uint64_t now) {
         std::lock_guard lock(s.mu);
         want = d->wanted;
         for (uint32_t m = 0; m < d->haptic_motors; ++m)
-            if (!d->haptic_until[m] || now < d->haptic_until[m]) haptic[m] = d->haptic_intensity[m];
+            haptic[m] = d->waveforms[m].level_at(now);
     }
     const bool muted = !s.config.rumble;
     if (muted) want = {};
@@ -1812,8 +1856,8 @@ void update_keyboard_pad() {
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
     bool aim = false, fire = false;
-    // Out of focus every button, stick and trigger is released, so a key held while switching windows does not stay
-    // pressed, and the cursor is read afresh on return, so moving it in another window does not swing the stick.
+    // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
+    // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
     if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
@@ -1841,11 +1885,37 @@ void update_keyboard_pad() {
     }
     clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
+    // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
+    // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt
+    // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). The parser, the timeline and the
+    // button names are gameinput_script.h's, shared with the scripted pad of a build without SDL3.
+    namespace script = rt::gameinput::script;
+    int right_y = g_keyboard.right_y;
+    static const script::Script scripted = [] {
+        script::Script s = script::parse(env("LEONIDA_INPUT_SCRIPT"));
+        if (!s.empty() || s.rejected)
+            std::fprintf(stderr, "[rt] gameinput: LEONIDA_INPUT_SCRIPT: %zu scripted press(es), %zu rejected\n",
+                         s.presses.size(), s.rejected);
+        return s;
+    }();
+    if (!scripted.empty()) {
+        static const ULONGLONG origin = GetTickCount64();
+        const double now = (GetTickCount64() - origin) / 1000.0;
+        const script::Held held = script::held_at(scripted, now);
+        if (held.stick) right_y = held.stick > 0 ? -kStickFull : kStickFull;  // SDL's +Y is down
+        for (const script::Button& b : script::kButtons) {
+            if (!(scripted.named & b.bit)) continue;
+            const auto button = static_cast<SDL_GamepadButton>(b.sdl);
+            SDL_SetJoystickVirtualButton(g_keyboard.js, button, (held.buttons & b.bit) || down[button]);
+        }
+        static uint32_t was = 0;
+        script::log_scripted(held.buttons, &was, now);
+    }
     const int reach = lx && ly ? kStickDiagonal : kStickFull;
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTY, static_cast<Sint16>(ly * reach));
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTX, static_cast<Sint16>(g_keyboard.right_x));
-    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(g_keyboard.right_y));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(right_y));
     // SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled, 32767 full.
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, aim ? 32767 : -32768);
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
@@ -1916,6 +1986,17 @@ void poll_once() {
         read_raw(d, &snap);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
+        // Every press is logged in LEONIDA_INPUT_SCRIPT's own form (name@seconds), so a session played by hand can
+        // be replayed unattended: join the logged items with commas. The right stick's vertical throws (what scrolls
+        // a page) are logged as rsup/rsdown. LEONIDA_INPUT_LOG=0 turns the lines off.
+        {
+            static const bool log_presses = env("LEONIDA_INPUT_LOG") != "0";
+            static const ULONGLONG log_origin = GetTickCount64();
+            if (log_presses)
+                rt::gameinput::script::log_presses(snap.gamepad.buttons & ~d->last_snap.gamepad.buttons,
+                                                   d->last_snap.gamepad.rightThumbstickY, snap.gamepad.rightThumbstickY,
+                                                   (GetTickCount64() - log_origin) / 1000.0, d->name.c_str());
+        }
         d->last_snap = snap;
         // A newly opened pad's first sample here is its baseline (active_input.h), so connecting a pad with a button
         // held changes nothing.
@@ -2021,19 +2102,27 @@ void Device::SetForceFeedbackMotorGain(uint32_t motorIndex, float masterGain) {
 HRESULT Device::SetHapticMotorState(uint32_t motorIndex, const void* params) {
     std::lock_guard lock(g().mu);
     if (motorIndex >= haptic_motors) return E_INVALIDARG;
+    auto& waveform = waveforms[motorIndex];
     if (!params) {  // stop the motor
-        haptic_intensity[motorIndex] = 0.0f;
-        haptic_until[motorIndex] = 0;
+        waveform = {};
         return S_OK;
     }
     const auto* p = static_cast<const GameInputHapticFeedbackParams*>(params);
     if (p->waveformIndex >= haptic_motor_info[motorIndex].waveformCount) return E_INVALIDARG;
-    haptic_intensity[motorIndex] = std::clamp(p->intensity, 0.0f, 1.0f);
+    waveform.intensity = std::clamp(p->intensity, 0.0f, 1.0f);
+    waveform.start = now_us();
+    waveform.duration = p->duration;
+    waveform.delay = p->repeatDelay;
     // duration and repeatDelay are microseconds; playCount 0 plays until the state is set again. The poll thread sends
-    // the level and drops it when the deadline passes.
+    // the level and drops it when the deadline passes. The sums saturate: a request longer than a uint64 of
+    // microseconds (a duration of UINT64_MAX, say) ends at UINT64_MAX, which the poll thread never reaches, instead of
+    // wrapping to a deadline already past or only a moment away.
+    constexpr uint64_t kMax = UINT64_MAX;
+    const auto mul = [](uint64_t a, uint64_t b) { return b && a > kMax / b ? kMax : a * b; };
+    const auto add = [](uint64_t a, uint64_t b) { return a > kMax - b ? kMax : a + b; };
     uint64_t total = p->playCount == 0 ? 0 : p->duration;
-    if (p->playCount > 1) total = p->duration * p->playCount + p->repeatDelay * (p->playCount - 1);
-    haptic_until[motorIndex] = total ? now_us() + total : 0;
+    if (p->playCount > 1) total = add(mul(p->duration, p->playCount), mul(p->repeatDelay, p->playCount - 1));
+    waveform.end = total ? add(waveform.start, total) : 0;
     return S_OK;
 }
 
@@ -2667,6 +2756,9 @@ void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &k
 
 }  // namespace rt::gameinput
 
+// GameInputCreate is GameInput.dll's export 1, and the retail executable imports it by that ordinal, which the loader
+// looks up as "#1". Without the alias the import misses the shim and binds to the host's GameInput.dll; under Wine that
+// is the builtin stub, which fails, and the title stops on the result.
 SHIM_TABLE(gameinput,
     {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
     {"gameinput.dll", "#1", reinterpret_cast<void*>(&GameInputCreate)},

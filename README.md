@@ -24,6 +24,7 @@
   <a href="#license">License</a> |
   <a href="docs/status.md">Status</a> |
   <a href="docs/objectives.md">Objectives</a> |
+  <a href="https://discord.gg/ETf4qj5acN">Discord</a> |
   <a href="https://t.me/PixelifyNext">Telegram</a>
 </p>
 
@@ -38,10 +39,42 @@ happens **on your PC, from your own legal obtained copy of the game**.
 > Everything the build creates (the generated shaders, extracted assets, the runtime folder and your saves) comes
 > from your game and stays on your PC. Never share those files.
 
+> [!NOTE]
+> **This fork builds on [NotRexed's original Leonida project](https://github.com/ItsNotRexed/Leonida) and [ubiquitarianism's Leonida Continued](https://github.com/ubiquitarianism/leonida).**
+
 Telegram: https://t.me/PixelifyNext
 
 <br>
 
+## Project status
+
+**Early. Nothing is playable yet.** On `main`, the game boots from your own copy on native Windows and on Linux
+through Proton: it shows the launch movie, the first-run pages and the landing prompt, which respond to a pad or
+the keyboard pad, then runs the story load to its end and enters the world phase. A first world frame has not been
+verified yet on any test machine. [First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
+[the Linux/Proton report](docs/linux_proton.md) has the timings and where it stops.
+
+| What | Status |
+|---|---|
+| Booting the game | ⚠️ Through the story load into the world phase, on native Windows and Linux/Proton; no world frame verified yet ([report](docs/linux_proton.md)) |
+| Story mode, anything playable | ❌ No |
+| Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
+| Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
+| Shaders: RDNA2 → SPIR-V translation | ✅ **26,503 / 26,503 translated**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry, with a per-shader metadata index for pipeline creation. The LLVM 23.1.5 Linux rerun at `c432cdc` and the LLVM 23.1.3 Windows rerun at `43d0015` both translated all 26,503 ([Linux](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7072972586), [Windows](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7074299915)). Translation and SPIR-V validation are separate steps; validation results are listed below. ⚠️ 23,841 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
+| SPIR-V validation (`spirv-val`) | ✅ **26,503 / 26,503 passed** in the LLVM 23.1.5 Linux rerun at `c432cdc` and in the full-corpus rerun at `43d4703`, after `dcd8ecf` fixed the SPIR-V ID-bound error ([Linux rerun](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7072972586), [full-corpus rerun](https://github.com/ItsNotRexed/Leonida/issues/881#issuecomment-7075507328)). On Windows at `43d0015`, all 26,503 translated but 26,501 passed validation; the two ID-bound failures were fixed by `dcd8ecf`. The intermediate `dedd75c` run also passed 26,501. |
+| Shader translator checked on a real GPU | ⚠️ The hand-written GPU tests (vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches, compute LDS/barriers/buffer stores, wave64 masks) have been run on more than 30 GPU and driver combinations, with results in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): NVIDIA Turing, Ampere, Ada and Blackwell (Windows and Linux); AMD GCN3, RDNA1, RDNA2, RDNA3 and RDNA4 (Windows driver and RADV); Intel Gen9 (ANV); Apple M1 (MoltenVK, no geometry or mesh stages); and Mesa llvmpipe. Wave64 tests need 64-wide subgroups (AMD) or `LEONIDA_W64_EMULATE=1`. These are small test shaders: the game's own shaders are checked by `spirv-val` and by driver pipeline creation (`vk_pipeline_check`), not by their output |
+| Models (OBJ with real names, UVs, material references) | ✅ Exported. A ten-archive scan at decoder pin `e293917` recovered **382,781 models** with zero readback decode failures. This includes **343,327** models from `levels.rpf`. A full OBJ export of that archive is pending. See [recount and export scope](docs/models.md#full-archive-re-count-at-e293917). |
+| Texture dictionaries and world texture pools (DDS) | ✅ Exported. `rpf9dump` decodes BCPack BC1, BC3, BC4 and BC5 chunks in strict mode and skips BC6H, BC7 and chunks that need unconfirmed history; the assets stage then completes what it can with a clean-room decoder (`tools/bcpack.py`, which `tools/ttpf_assets.py` runs through `tools/ttpf_mips.py`) that rebuilds BC1, BC3, BC4, BC5, BC6H and BC7, and records the rest as a `BCPackLimitation` in `manifest.json` (most BC6H/BC7 chunks and the unconfirmed-history ones need a local history table, which the repo does not ship) ([notes](docs/textures.md)) |
+| Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
+| Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
+| PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Controllers through a GameInput shim on SDL3 (any controller SDL supports, rumble, DualSense trigger effects and lightbar; built when SDL3 is installed or with `-DLEONIDA_SDL3_FETCH=ON`, [notes](docs/gameinput.md)). `--trace-d3d12` logs every D3D12 call and its outcome for the first boot. Runs the game's own executable through the story load ([report](docs/linux_proton.md)) |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed, placed and reserved resources, render-target and depth views (3D targets included), texture views and samplers (2D, cube, 1D and 3D views, the depth and stencil planes of depth-stencil textures, packed formats such as B5G6R5, B4G4R4A4 and R9G9B9E5, buffer SRVs — raw, structured and typed; they go into the bindless set), root signatures, pipelines and query heaps, and draws run on Vulkan. Barriers, clears, uploads, copies (BC included), colour resolves, predication, CPU-side texture reads and writes, and occlusion, timestamp and pipeline-statistics queries run on Vulkan, checked on one GPU. The console-shaped command-list proxy, the measured `PresentX` queue slots (30/32, layout-detected) wired to the presentation core, and `AllocateUploadMemory` (list slot 148, a mapped-upload arena whose addresses translate to buffer device addresses in root descriptors and IA/SO views) cover the console-ABI surface the package measures. Still open: the console list tail and the descriptor-table record model ([plan](docs/d3d12_vulkan.md), [console ABI](docs/d3d12_xs_console_abi.md)) |
+| Ray tracing (BVH) | ⚠️ In progress. `BuildRaytracingAccelerationStructure` builds BLASes and TLASes on the GPU in the console's XDXR BVH4 layout (the default; `LEONIDA_RT_AS=khr` uses Vulkan's own acceleration structures instead), which the translated shaders walk themselves through `image_bvh_intersect_ray` (all four triangle node types, TRI0-TRI3, with the barycentric remap byte); the GPU builder writes TRI0 and TRI1 leaves. Updates refit instead of rebuilding, and clone, compaction and the compacted/current postbuild sizes work; checked against a CPU reference on synthetic scenes. The build descriptions are recovered from the package's `XboxBvhBuilder.dll` ([notes](docs/xdxr.md)). The game's `*_bvh4.rpf` packs are measured: offline-built, dehydrated BLASes that rehydrate through that DLL with their geometry from the drawables in `levels.rpf` (measured on 8 of the 10 sampled BLAS; [notes](docs/bvh.md)). Not done in the builder: serialization. TRI1 pairing (no memory saved yet) and BOX16 nodes for `MINIMIZE_MEMORY` BLASes (an assumed switch) are in ([notes](docs/bvh.md)). Open: whether the game rehydrates the packs or rebuilds them ([#313](https://github.com/ItsNotRexed/Leonida/issues/313)) |
+
+The table above is written by hand. To measure it on your own checkout (unit and runtime tests, which rows of
+the translator contract were confirmed on a GPU, measured imports, your corpus counts and, with `--github`, CI
+and the `D3D-` items), run `python -I tools/progress_dashboard.py --out <folder outside the repo>` and open
+`progress.html` ([notes](docs/progress_dashboard.md)).
 
 
 ## Platforms
@@ -51,7 +84,7 @@ Nothing is playable on any platform yet (see *Project status*). What runs where 
 | Platform | Today |
 |---|---|
 | Windows | Everything: `make_game.py`, the tools, and the runtime (`gta6rt` and the D3D12 → Vulkan layer) with its tests. |
-| Linux | The translator, the asset tools and the Vulkan GPU test tools build and run natively (tested on RADV and NVIDIA). The runtime is Windows code: it cross-compiles with clang-cl and xwin, and its tests run under Wine or Proton (*The Windows runtime on Linux, under Wine or Proton* below). The game is meant to run the same way, under Wine or Proton with the D3D12 layer on native Vulkan (#217). |
+| Linux | The translator, the asset tools and the Vulkan GPU test tools build and run natively (tested on RADV and NVIDIA). The runtime is Windows code: it cross-compiles with clang-cl and xwin, and its tests run under Wine or Proton (*The Windows runtime on Linux, under Wine or Proton* below). The game runs the same way, under Proton with the D3D12 layer on native Vulkan, so far through the story load ([report](docs/linux_proton.md)) (#217). `./Build.sh` starts the build; [docs/linux.md](docs/linux.md) has the packages and the steps. |
 | macOS (Apple Silicon) | The Python tools and the Vulkan test tools run natively, on MoltenVK (Homebrew) or KosmicKrisp. The runtime is Windows code and runs as on Linux, under Wine: CrossOver, arm64 with FEX or x86-64 under Rosetta (#1706, #1707, #1924; #3119 fixes the last loader tests there). Known gaps: no geometry stage and no `VK_EXT_mesh_shader` (those tests are skipped), 32-wide subgroups (wave64 shaders run emulated), and MoltenVK's float handling (`PerVertexKHR`, NaN compares, -0, the cost of `NoContraction`); [docs/testing.md](docs/testing.md) lists each (#2947). |
 | AMD RDNA1 (RX 5000) | A supported target: close to the console's RDNA2, and its 64-wide subgroups run the wave64 shaders natively. RX 5700 XT results pass the GPU test suite (#146); on RADV, pixel shaders without fragment barycentrics have a known difference (*Known problems* in [docs/testing.md](docs/testing.md)) (#330). |
 
@@ -67,7 +100,8 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 2. Download this project **with its submodule**: `git clone --recursive https://github.com/BasGame1/Leonida`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
-3. Double-click **`Build.bat`**.
+3. Double-click **`Build.bat`**. On Linux or macOS, run **`./Build.sh`** from a terminal instead (see
+   [docs/linux.md](docs/linux.md) for Linux).
 
 It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
 such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
@@ -93,15 +127,13 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
   path of the `llvm-mc.exe` it installs (`where.exe llvm-mc` shows it once the environment is active; in PowerShell a
   bare `where` is `Where-Object`). Or install `llvm-21`
   in WSL and set `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
-  [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough.
+  [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough, and so is a
+  versioned distribution install such as Ubuntu's `llvm-21` (`llvm-mc-21`, `/usr/lib/llvm-21/bin/llvm-mc`).
 - Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
-**Is this PC strong enough?** `python -I tools/pc_checker.py --cli` detects the CPU, GPU and RAM and compares them
-with the reference profiles before a long build: `--profile 1`, the default, is an Xbox Series X PC equivalent and
-`--profile 2` a 1080p Low community estimate. `python -I tools/pc_checker.py --check --json` prints the same verdict
-as JSON and returns it as an exit code (0 good, 1 weak, 2 unknown).
+**Is this PC strong enough?** [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/) is a lightweight browser-based checker that compares your PC against reference profiles. It's a rough estimate, not a benchmark.
 
 **Low disk space:** the ~400 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
 needs about 30 GB; the `assets` stage (~370 GB) is only for the asset tools, and `--wav` adds several times the
@@ -111,6 +143,29 @@ can sit on another drive. The runtime maps the package in place, so a read-only 
 files in `work/shaders/dxbc/disasm` in place: the next run checks them against the list in `disasm.done` and
 disassembles the missing ones again (all of them for a folder whose `disasm.done` predates that list), then
 translates every shader again. A `disasm` folder that is a symlink is refused when the stage has to clear it.
+
+**Disk space and drives:** the build uses three folders, and each can be on its own drive:
+
+| Folder | Flag | What is in it | Size | Read when playing |
+|---|---|---|---|---|
+| your package | `--game` | your copy of the game; only read, never written | as copied | yes, in place (`game_path.txt`) |
+| work | `--work` (default `<out>\work`) | `shaders` (carved, disassembled, translated) and `assets` (exports) | about 30 GB + about 370 GB | only `shaders\spirv` (`shader_path.txt`) |
+| port | `--out` (default `Documents\Leonida`) | `gta6rt.exe`, its DLL, the path files, the pipeline cache, `overlay` | small | yes |
+
+The free-space check before a build counts the `--work` drive only, because that is where the large files go.
+Nothing in `<work>\assets` is read by the game, so with a small SSD you can keep what the game loads on the SSD and
+put the exports on a hard drive, in two runs:
+
+```powershell
+# on the SSD: the package, the port and the translated shaders (about 30 GB of work files)
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "S:\Games\Leonida\work" --stages check,shaders,runtime,pipelines
+# on the hard drive: the asset exports (about 370 GB), only for the asset tools
+python -I make_game.py --game "S:\Games\package" --out "S:\Games\Leonida" --work "H:\leonida-assets" --stages check,assets
+```
+
+The second run does not rebuild the runtime, so `shader_path.txt` keeps pointing at the SSD. Pass the same
+`--work` again for later runs of each stage so they resume. A single `--work "H:\leonida-work"` also works; the
+game then loads its translated shaders from that drive.
 
 **From a terminal**, with the same behaviour and more control:
 
@@ -224,11 +279,15 @@ in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEON
 | Piece | What it does | Where |
 |---|---|---|
 | Version check | Every package file's name, size and SHA-256 for each supported version | `game/`, `make_game.py` |
-| Shader pipeline | Carves DXBC containers from `shaders.rpf` without its encrypted table of contents. Unpacks the `XBCH` → `FSSM` native RDNA2 program, disassembles it with LLVM (`gfx1013`) and translates it to SPIR-V | `tools/shader_carve.py`, `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` |
+| Shader pipeline | Carves DXBC containers from `shaders.rpf` without its encrypted table of contents. Unpacks the `XBCH` → `FSSM` native RDNA2 program, disassembles it with LLVM (`gfx1013`) and translates it to SPIR-V | `tools/shader_carve.py` ([optional Rust scanner](tools/shader_carve_native/README.md)), `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` |
 | Asset export | Finds validated resources inside RPF9 archives and the loose `.ttpf` texture pools | `tools/rpf9dump` (on rpf9-explorer's Core) |
 | Runtime | Maps the PE image, resolves imports to shims (GDK, XMem, `d3d12_xs`) | `runtime/` |
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
 | Progress dashboard | One offline page of what passes, what changed since it last passed and what blocks next, built from test results and the docs' own tables; nothing is written inside the repo | `tools/progress_dashboard.py` |
+
+Localized string tables are decoded by `tools/text_tables.py` ([docs/text.md](docs/text.md)); their language is
+guessed from script (kana, hangul, CJK, Cyrillic, Arabic) or Latin words, and subtitles are joined to dialogue lines
+across languages.
 
 The translator's runtime contract (user SGPRs, push constants, memory model, bindless images, vertex fetch,
 system values) and all the format notes are in [docs/design.md](docs/design.md); the format, asset, runtime
@@ -241,11 +300,13 @@ read and the licence limits on it.
 
 The biggest open pieces:
 
+- **World start**: the story load finishes, but no world frame has been verified yet;
+  [Where it stops](docs/linux_proton.md#where-it-stops) lists what stops it.
 - **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
   [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
   unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
 - **Xbox D3D12 → Vulkan**: mesh-shader draws, indirect draw state and stream output are still open; #313 tracks the
-  remaining method surface, and nothing has been checked against the real executable yet ([plan and status](docs/d3d12_vulkan.md)).
+  remaining method surface. The Windows integration exercises the first-run UI. [Plan and status](docs/d3d12_vulkan.md)
 - **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
@@ -256,6 +317,11 @@ pull requests.
   
 ## Credits
 
+- [Leonida](https://github.com/ItsNotRexed/Leonida) by NotRexed and contributors: the original project, which this
+  repository continues.
+- [Leonida Continued](https://github.com/ubiquitarianism/leonida) by ubiquitarianism and contributors (including
+  Moriz82, OreoFR, Mby159, aslan2142, TheGeogeo, MoonEyes, and others): post-story-load runtime, DirectStorage,
+  AcpHal/CHAD/XAPU/WS2/SilentAudio shims, console D3D12 ABI and Vulkan backend advances, and translator improvements.
 - [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) by breadbbbb: the RPF9 model, texture-pool and AWC
   decoders used by `tools/rpf9dump` (git submodule).
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (MIT): GFX10 resource-descriptor layout (`tools/gfx10_formats.json`),

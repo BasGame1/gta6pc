@@ -298,3 +298,53 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
     await older;
     assert.equal(output.textContent, 'R = -2.5');
 });
+
+test('single-mip single-layer DDS still shows dimensions without adding inputs', async () => {
+    const { context, elements, run } = loadStudio();
+    const info = {width: 32, height: 16, mip_count: 1, array_size: 1, format: 'BC1_UNORM'};
+    const requests = [];
+    context.fetch = async url => {
+        requests.push(url);
+        return {ok: true, json: async () => info};
+    };
+    await run("openModal({name:'a', preview:'/a.png', ddsPreview:'/api/dds/a.dds'})");
+    const image = elements.get('modal-img');
+    const controls = elements.get('dds-controls');
+    assert.deepEqual(requests, ['/api/dds/a.dds?info']);
+    assert.equal(controls.children.length, 1);
+    assert.equal(controls.children[0].textContent, '32 \u00d7 16');
+    assert.equal(controls.children[0].children.length, 0);
+    assert.equal(image.src, '/a.png');
+});
+
+test('hostile texture preview URLs and format labels render escaped across both batches', () => {
+    function renderCards(preview, format) {
+        const studio = loadStudio();
+        studio.context.textures = Array.from({ length: 81 },
+            () => ({ name: 'plain.png', format, size: 4, preview }));
+        studio.run('allTextures = textures; renderTexturesGrid();');
+        const grid = studio.elements.get('textures-grid');
+        grid.children.at(-1).onclick();
+        const cards = grid.children.filter(child => child.className === 'tex-card');
+        assert.equal(cards.length, 81);
+        return [cards[0].innerHTML, cards[80].innerHTML];
+    }
+
+    const [plain0, plain80] = renderCards('/textures/x.png', 'PNG Image');
+    const plainShape0 = tagShape(plain0);
+    const plainShape80 = tagShape(plain80);
+    for (const [label, preview, format] of [
+        ['preview', '/textures/' + HOSTILE, 'PNG Image'],
+        ['format', '/textures/x.png', HOSTILE],
+    ]) {
+        const cards = renderCards(preview, format);
+        assert.deepEqual(tagShape(cards[0]), plainShape0, `${label} in initial batch injected markup`);
+        assert.deepEqual(tagShape(cards[1]), plainShape80, `${label} in show-all batch injected markup`);
+        for (const markup of cards) {
+            assert.ok(!markup.includes(HOSTILE), `${label} rendered unescaped hostile string`);
+            if (label === 'format') {
+                assert.ok(visibleText(markup).includes(HOSTILE), 'escaped format must preserve visible text');
+            }
+        }
+    }
+});

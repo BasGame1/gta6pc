@@ -283,6 +283,7 @@ class ImageStoreD16Tests(unittest.TestCase):
     def test_all_store_dims_a16_glc_and_wave64_emulate_validate(self):
         cases = [
             ("1D", "v2", "dmask:0x1", "d16"),
+            ("1D_ARRAY", "v[2:3]", "dmask:0xf", "d16"),
             ("2D", "v2", "dmask:0xf", "a16 d16"),
             ("2D", "v[2:3]", "dmask:0x3", "glc d16"),
             ("2D_ARRAY", "v[2:3]", "dmask:0xf", "a16 d16"),
@@ -334,9 +335,22 @@ class ImageStoreD16Tests(unittest.TestCase):
                 rdna2spirv.WAVE64_EMULATE = old_w64
         _validate(spv)
 
+    def test_cube_storage_image_d16_translates(self):
+        # Cube storage images are supported and bound as 6-layer 2D arrays (#6805)
+        spv = support.translate_lines(
+            "ps_img_store_cube_d16",
+            [
+                "v_mov_b32_e32 v2, 0",
+                "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
+                "exp mrt0 v2, v2, v2, v2 done vm",
+                "s_endpgm",
+            ],
+        )
+        _validate(spv)
+
     def test_unsupported_dims_and_modifiers_still_refused(self):
         for bad in (
-            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_1D_ARRAY unorm d16",
+            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm d16",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 tfe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 lwe",
         ):

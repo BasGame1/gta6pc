@@ -4,7 +4,10 @@ reports/
 work/
 /assets/*
 !/assets/logo.png
+!/assets/logo.svg
 carve/
+# rpf9-explorer's index cache (archive paths and entry names); see "Full-scan indexes" in docs/design.md
+RpfPreview/
 *.rpf
 *.ttpf
 *.xvd
@@ -28,6 +31,7 @@ build-*/
 bin/
 obj/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.exe
 *.dll
@@ -38,3 +42,7 @@ __pycache__/
 *.log
 .vs/
 .xwin-cache/
+
+# Predictor profiles are fitted from the user's own texture pools.
+*.bcph
+*.bcph.stamp

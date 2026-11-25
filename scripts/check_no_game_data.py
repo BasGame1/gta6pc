@@ -8,8 +8,9 @@ as .txt. This reads the first bytes of each file and matches the magic numbers o
 files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/DXBC shader
 containers, SPIR-V, DDS, AWC audio, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, YSC/SCRP compiled scripts, the
 animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE executables and XVD
-images. The magics are
-the ones docs/ measures (docs/gamedata.md and the shader and audio notes). Text formats (disassembly, .obj, .spvasm)
+images, the player's saves (JSAV, ASAV and SLAYER1) and world_build.py's LPK1 staging packs of the game's
+geometry. The magics are the ones docs/ measures (docs/gamedata.md, docs/saves.md and the shader and audio
+notes). Text formats (disassembly, .obj, .spvasm)
 have no magic and stay with the extension check.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
@@ -20,7 +21,8 @@ under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb
 reported as archives that can't be checked.
 
 Prints one line per match, `<path>: <format>` (`<format> in <archive> (<member>)` for a match inside an archive), and
-exits 1 if there is any. Standard library only, no game files.
+exits 1 if there is any. It exits 2 when a file cannot be read or git cannot list the tracked files (outside a
+repository, or git not installed). Standard library only, no game files.
 """
 import bz2
 import gzip
@@ -40,6 +42,7 @@ MAGICS = (
     ("RPF9 archive", 0, b"9FPR"),
     ("RPF9 archive", 0, b"RPF9"),
     ("TTPF texture pool", 0, b"TTPF"),
+    ("local BCPack predictor profile", 0, b"BCPHIST1"),
     ("RAGE resource", 0, b"RSC7"),
     ("RAGE resource", 0, b"RSC8"),
     ("RAGE resource", 0, b"RSCC"),
@@ -64,6 +67,11 @@ MAGICS = (
     ("MoVE animation container", 0, b"MoVE"),
     ("SKEL_ bone table", 0, b"SKEL_"),
     ("SCRP compiled script", 0, b"SCRP"),
+    # docs/saves.md: "Never commit or attach real saves"; and the geometry world_build.py packs from the game's models.
+    ("JSAV story save", 0, b"JSAV"),
+    ("ASAV save record", 0, b"ASAV"),
+    ("SLAYER1 packed save", 0, b"SLAYER1\0"),
+    ("LPK1 world staging pack", 0, b"LPK1"),
     ("Ogg stream", 0, b"OggS"),
     ("Bink 2 video", 0, b"KB2"),
     ("Bink video", 0, b"BIK"),
@@ -251,13 +259,28 @@ def tracked_files(root):
     return [os.path.join(root, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
-def check(paths):
-    """[(path, format)] for every regular file in `paths` that starts like game data."""
+def git_error(e):
+    """One line on why git could not list the files: the first line git printed, or the OS error."""
+    if isinstance(e, subprocess.CalledProcessError):
+        lines = (e.stderr or b"").decode("utf-8", "replace").splitlines()
+        return next((line.strip() for line in lines if line.strip()), f"exit status {e.returncode}")
+    return e.strerror or str(e)
+
+
+def check(paths, unreadable=None):
+    """[(path, format)] for every regular file in `paths` that starts like game data.
+
+    A file that exists but cannot be opened or read is appended to `unreadable` (when given) as (path, error)."""
     found = []
     for path in paths:
         if os.path.islink(path) or not os.path.isfile(path):
             continue  # submodules, symlinks, files deleted in the working tree
-        name = classify_file(path)
+        try:
+            name = classify_file(path)
+        except OSError as e:
+            if unreadable is not None:
+                unreadable.append((path, e))
+            continue
         if name:
             found.append((path, name))
     return found
@@ -272,14 +295,24 @@ def display(path):
 
 
 def main(argv):
-    paths = argv or tracked_files(os.getcwd())
-    found = check(paths)
+    if argv:
+        paths = argv
+    else:
+        try:
+            paths = tracked_files(os.getcwd())
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"check_no_game_data: cannot list the tracked files with git: {git_error(e)}", file=sys.stderr)
+            return 2  # not 1: that is the 'game data found' code
+    unreadable = []
+    found = check(paths, unreadable)
     for path, name in found:
         print(f"{display(path)}: {name}")
+    for path, e in unreadable:
+        print(f"check_no_game_data: cannot read {display(path)}: {e.strerror or e}", file=sys.stderr)
     if found:
         print(f"{len(found)} file(s) start like game data. Remove them; see CONTRIBUTING.md.", file=sys.stderr)
         return 1
-    return 0
+    return 2 if unreadable else 0  # 2: some files could not be checked and none of the others matched
 
 
 if __name__ == "__main__":

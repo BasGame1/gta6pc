@@ -5,6 +5,7 @@
 Zero game data: every library and archive is built here from synthetic bytes.
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -18,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import shader_library as sl  # noqa: E402
+import shader_meta  # noqa: E402
 
 ENDPGM = struct.pack("<I", 0xBF810000)
 CODE_END = struct.pack("<I", 0xBF9F0000)
@@ -193,16 +195,137 @@ class Main(unittest.TestCase):
             rc = sl.main(list(args))
         return rc, out.getvalue()
 
+    def assert_save_overlap(self, src, out, save, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            self.run_main(src, "--out", out, "--save", save, *args)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--save overlaps an --out path", err.getvalue())
+        self.assertIn(save, err.getvalue())
+
+    def test_save_cannot_create_an_extraction_output(self):
+        for parts in ((), ("index.json",), ("library.json",), ("fspx",),
+                      ("fspx", "lib_ps_00000.code"), ("fspx", "lib_ps_00000.json"),
+                      ("fspx", "lib_cs_00003.state"), ("fspx", "lib_ps_00000.state"),
+                      ("disasm",), ("disasm", "lib_ps_00000.s")):
+            with self.subTest(parts=parts), tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "shaders.rpf")
+                with open(src, "wb") as f:
+                    f.write(archive(sample()))
+                out = os.path.join(tmp, "out")
+                args = ("--disasm",) if parts and parts[0] == "disasm" else ()
+                self.assert_save_overlap(src, out, os.path.join(out, *parts), *args)
+                self.assertEqual(os.listdir(tmp), ["shaders.rpf"])
+
+    def test_save_overlap_leaves_existing_outputs_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            fspx = os.path.join(out, "fspx")
+            os.makedirs(fspx)
+            index = os.path.join(out, "index.json")
+            code = os.path.join(fspx, "lib_ps_00000.code")
+            for path, contents in ((index, b"old index"), (code, b"old code")):
+                with open(path, "wb") as f:
+                    f.write(contents)
+
+            aliases = [index, os.path.join("out", "fspx", "..", ".", "index.json"), code]
+            case_alias = os.path.join(out, "INDEX.JSON")
+            if os.path.exists(case_alias):
+                aliases.append(case_alias)
+            for save in aliases:
+                with self.subTest(save=save), contextlib.chdir(tmp):
+                    self.assert_save_overlap(src, out, save)
+                    self.assertEqual(sorted(os.listdir(out)), ["fspx", "index.json"])
+                    self.assertEqual(os.listdir(fspx), ["lib_ps_00000.code"])
+                    with open(index, "rb") as f:
+                        self.assertEqual(f.read(), b"old index")
+                    with open(code, "rb") as f:
+                        self.assertEqual(f.read(), b"old code")
+
+    def test_save_overlap_through_symlink_or_hardlink(self):
+        for link in (os.symlink, os.link):
+            with self.subTest(link=link.__name__), tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "lib.bin")
+                with open(src, "wb") as f:
+                    f.write(sample())
+                out = os.path.join(tmp, "out")
+                os.mkdir(out)
+                index = os.path.join(out, "index.json")
+                with open(index, "wb") as f:
+                    f.write(b"old index")
+                save = os.path.join(tmp, "alias")
+                try:
+                    link(index, save)
+                except (OSError, NotImplementedError) as e:
+                    self.skipTest(f"{link.__name__} unavailable: {e}")
+                self.assert_save_overlap(src, out, save)
+                self.assertEqual(os.listdir(out), ["index.json"])
+                for path in (index, save):
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), b"old index")
+
+    def test_save_cannot_alias_an_out_ancestor_directory(self):
+        for precreate in (False, True):
+            with self.subTest(precreate=precreate), tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "lib.bin")
+                with open(src, "wb") as f:
+                    f.write(sample())
+                parent = os.path.join(tmp, "parent")
+                if precreate:
+                    with open(parent, "wb") as f:
+                        f.write(b"sentinel")
+                out = os.path.join(parent, "nested")
+                self.assert_save_overlap(src, out, parent)
+                if precreate:
+                    with open(parent, "rb") as f:
+                        self.assertEqual(f.read(), b"sentinel")
+                else:
+                    self.assertEqual(os.listdir(tmp), ["lib.bin"])
+
+    def test_save_can_write_noncolliding_file_inside_fresh_out_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            save = os.path.join(out, "fspx", "raw.bin")
+            rc, _ = self.run_main(src, "--out", out, "--save", save)
+            self.assertEqual(rc, 0)
+            with open(save, "rb") as f:
+                self.assertEqual(f.read(), sample())
+            self.assertTrue(os.path.isfile(os.path.join(out, "index.json")))
+
+    def test_save_can_use_a_filtered_program_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            fspx = os.path.join(out, "fspx")
+            os.makedirs(fspx)
+            save = os.path.join(fspx, "lib_ps_00000.code")
+            rc, _ = self.run_main(src, "--out", out, "--stages", "vs", "--save", save)
+            self.assertEqual(rc, 0)
+            with open(save, "rb") as f:
+                self.assertEqual(f.read(), sample())
+            self.assertEqual(sorted(os.listdir(fspx)), ["lib_ps_00000.code", "lib_vs_00001.code", "lib_vs_00001.json"])
+
     def test_unpack_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "shaders.rpf")
             with open(src, "wb") as f:
                 f.write(archive(sample()))
             out = os.path.join(tmp, "out")
-            rc, text = self.run_main(src, "--out", out, "--save", os.path.join(tmp, "lib.bin"))
+            other = os.path.join(tmp, "other")
+            os.mkdir(other)
+            save = os.path.join(other, "saved.json")
+            rc, text = self.run_main(src, "--out", out, "--save", save)
             self.assertEqual(rc, 0)
             self.assertIn("2 graphics + 1 compute pipelines, 4 programs; 4 written", text)
-            with open(os.path.join(tmp, "lib.bin"), "rb") as f:
+            with open(save, "rb") as f:
                 self.assertEqual(f.read(), sample())
             with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
                 index = json.load(f)
@@ -222,6 +345,16 @@ class Main(unittest.TestCase):
                 summary = json.load(f)
             self.assertEqual(summary["graphics"][1]["stages"], {"ps": "lib_ps_00000", "ms": "lib_ms_00002"})
             self.assertEqual(summary["compute"][0]["program"], "lib_cs_00003")
+            # The compute program gets its record's state blob as kind 0, which the run time finds a slot-67
+            # pipeline by (fspx_state_sha256); a graphics program gets none.
+            with open(os.path.join(out, "fspx", "lib_cs_00003.state"), "rb") as f:
+                self.assertEqual(f.read(), kind0())
+            self.assertFalse(os.path.exists(os.path.join(out, "fspx", "lib_vs_00001.state")))
+            disasm_file = os.path.join(out, "disasm", "lib_cs_00003.s")
+            self.assertEqual(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00003"),
+                             hashlib.sha256(kind0()).hexdigest())
+            self.assertEqual(shader_meta.fspx_code_sha256_file(disasm_file, "lib_cs_00003"),
+                             hashlib.sha256(sl.program(sample(), sl.parse(sample()), 3)).hexdigest())
 
     def test_stage_filter_and_saved_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,7 +365,69 @@ class Main(unittest.TestCase):
             rc, text = self.run_main(src, "--out", out, "--stages", "cs,vs")
             self.assertEqual(rc, 0)
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
-                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
+                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state", "lib_vs_00001.code",
+                              "lib_vs_00001.json"])
+
+    def test_compute_missing_state_removes_stale_state_and_skips_none_blob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(out, "fspx"))
+            stale = os.path.join(out, "fspx", "lib_cs_00000.state")
+            with open(stale, "wb") as f:
+                f.write(b"stale state")
+            src = os.path.join(tmp, "lib.bin")
+            # Compute record with NONE state (0xFFFFFFFF) must not crash or keep a stale .state sidecar.
+            with open(src, "wb") as f:
+                f.write(build([], [(NONE, NONE, 0, NONE)], [], [prog(0x11112222)]))
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(stale))
+            disasm_file = os.path.join(out, "disasm", "lib_cs_00000.s")
+            self.assertIsNone(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00000"))
+            meta = shader_meta.collect(disasm_file, "lib_cs_00000", [[]], [[]])
+            self.assertIn("fspx_code_sha256", meta)
+            self.assertNotIn("fspx_state_sha256", meta)
+
+    def test_same_code_with_distinct_states_gets_distinct_state_keys(self):
+        code = prog(0x44556677)
+        s_a, s_b = kind0(threads=(32, 1, 1)), kind0(threads=(64, 1, 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(build([], [(0, NONE, 0, NONE), (1, NONE, 1, NONE)], [s_a, s_b], [code, code]))
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            metas = [
+                shader_meta.collect(os.path.join(out, "disasm", f"lib_cs_{i:05d}.s"), f"lib_cs_{i:05d}", [[]], [[]])
+                for i in range(2)
+            ]
+            self.assertEqual({m["fspx_code_sha256"] for m in metas}, {hashlib.sha256(code).hexdigest()})
+            self.assertEqual([m["fspx_state_sha256"] for m in metas],
+                             [hashlib.sha256(s_a).hexdigest(), hashlib.sha256(s_b).hexdigest()])
+
+    def test_compute_hash_filter_keeps_distinct_states(self):
+        first, second = kind0(), kind0(threads=(32, 1, 1))
+        code = prog(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(build([], [(i, NONE, 0, NONE) for i in range(3)] + [(0, NONE, 1, NONE)],
+                              [first, second, first], [code, prog(4)]))
+            hashes = os.path.join(tmp, "hashes.txt")
+            with open(hashes, "w", encoding="utf-8", newline="\n") as f:
+                f.write(hashlib.sha256(code).hexdigest() + "\n")
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--compute-hashes", hashes)
+            self.assertEqual(rc, 0)
+            names = ["lib_cs_00000", "lib_cs_00000_state_1"]
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([e["file"] for e in json.load(f)], [n + ".dxbc" for n in names])
+            for name, state in zip(names, (first, second)):
+                with open(os.path.join(out, "fspx", name + ".state"), "rb") as f:
+                    self.assertEqual(f.read(), state)
+            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
+                self.assertEqual([e["program"] for e in json.load(f)["compute"][:3]], [*names, names[0]])
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,7 +445,11 @@ class Main(unittest.TestCase):
             with open(src, "wb") as f:
                 f.write(sample())
             out = os.path.join(tmp, "out")
-            rc, text = self.run_main(src, "--out", out, "--carve", carve)
+            self.assert_save_overlap(src, out, os.path.join(out, "lib_vs_00001.dxbc"), "--carve", carve)
+            self.assertFalse(os.path.exists(out))
+            os.mkdir(out)
+            save = os.path.join(out, "lib_ms_00002.dxbc")
+            rc, text = self.run_main(src, "--out", out, "--carve", carve, "--save", save)
             self.assertEqual(rc, 0)
             self.assertIn("3 of 4 named by a carved shader's HASH digest, 1 not in the carve", text)
             with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
@@ -260,7 +459,8 @@ class Main(unittest.TestCase):
             self.assertEqual(by["lib_ms_00002.dxbc"]["source"], [])
             with open(os.path.join(out, "lib_vs_00001.dxbc"), "rb") as f:
                 self.assertEqual(f.read(), dxbc(D_VS))
-            self.assertFalse(os.path.exists(os.path.join(out, "lib_ms_00002.dxbc")))
+            with open(save, "rb") as f:
+                self.assertEqual(f.read(), sample())
             with open(os.path.join(out, "fspx", "lib_ps_00000.json"), encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["digest"], [D_PS.hex()])
 
@@ -296,6 +496,99 @@ class Main(unittest.TestCase):
                     rdna2spirv.translate(s_path)
             finally:
                 rdna2spirv._STAGES = None
+
+    def test_carve_reports_corrupt_and_unreadable_containers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            with open(os.path.join(carve, "VS_C.dxbc"), "wb") as f:
+                f.write(dxbc(D_VS)[:20])                             # truncated header
+            with open(os.path.join(carve, "MS_D.dxbc"), "wb") as f:
+                f.write(dxbc(D_MS)[:-4])                             # truncated part payload
+            os.makedirs(os.path.join(carve, "CS_B.dxbc"))            # exists on disk, unreadable OSError
+            index = [
+                {"name": "PS_A", "file": "PS_A.dxbc"},
+                {"name": "gone", "file": "gone.dxbc"},               # missing: skipped silently
+                {"name": "VS_C", "file": "VS_C.dxbc"},
+                {"name": "MS_D", "file": "MS_D.dxbc"},
+                {"name": "CS_B", "file": "CS_B.dxbc"},
+            ]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = sl.main([src, "--out", out, "--carve", carve])
+            self.assertEqual(rc, 0)
+            self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve, "
+                          "3 unreadable/corrupt containers", stdout.getvalue())
+            err_lines = stderr.getvalue().splitlines()
+            self.assertEqual(len(err_lines), 3)
+            self.assertEqual(err_lines[0], "carve: VS_C.dxbc: truncated DXBC header")
+            self.assertEqual(err_lines[1], "carve: MS_D.dxbc: truncated DXBC part payload")
+            self.assertTrue(err_lines[2].startswith("carve: CS_B.dxbc: ") and len(err_lines[2]) > len("carve: CS_B.dxbc: "))
+            self.assertNotIn("gone.dxbc", stderr.getvalue())
+            self.assertTrue(os.path.isfile(os.path.join(out, "lib_ps_00000.dxbc")))
+
+    def test_carve_missing_only_stays_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            index = [
+                {"name": "PS_A", "file": "PS_A.dxbc"},
+                {"name": "gone", "file": "gone.dxbc"},
+            ]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = sl.main([src, "--out", out, "--carve", carve])
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve\n", stdout.getvalue())
+            self.assertNotIn("unreadable/corrupt", stdout.getvalue())
+
+    def test_carve_single_corrupt_container_and_direct_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            with open(os.path.join(carve, "ZERO.dxbc"), "wb") as f:
+                f.write(bytes(64))                                   # valid length/count=0, wrong magic
+            index = [
+                {"name": "PS_A", "file": "PS_A.dxbc"},
+                {"name": "ZERO", "file": "ZERO.dxbc"},
+            ]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            direct_err = io.StringIO()
+            with contextlib.redirect_stderr(direct_err):
+                digests = sl.carve_digests(carve)
+            self.assertEqual(digests, {D_PS: [("PS_A", os.path.join(carve, "PS_A.dxbc"))]})
+            self.assertEqual(direct_err.getvalue().splitlines(), ["carve: ZERO.dxbc: not a DXBC container"])
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = sl.main([src, "--out", out, "--carve", carve])
+            self.assertEqual(rc, 0)
+            self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve, "
+                          "1 unreadable/corrupt container\n", stdout.getvalue())
+            self.assertEqual(stderr.getvalue().splitlines(), ["carve: ZERO.dxbc: not a DXBC container"])
 
 
 if __name__ == "__main__":

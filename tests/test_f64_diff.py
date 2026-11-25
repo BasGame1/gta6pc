@@ -35,6 +35,14 @@ class F64DiffTests(unittest.TestCase):
         self.assertEqual(self.command("--ops", "v_not_real_f64").returncode, 2)
         self.assertEqual(self.command("--programs", "-1").returncode, 2)
 
+    def test_reference_reads_a_literal_by_its_printed_width(self):
+        # The translator's rule, mirrored: a spelling of more than 8 hex digits is the whole word,
+        # so a padded value that fits 32 bits is not shifted into the high half.
+        self.assertEqual(fd.read_source("0x12345678", {}, {}), 0x12345678_00000000)
+        self.assertEqual(fd.read_source("0x0000000012345678", {}, {}), 0x0000000012345678)
+        self.assertEqual(fd.read_source("0x3ff80000", {}, {}), 0x3FF80000_00000000)
+        self.assertEqual(fd.read_source("1", {}, {}), 1)
+
     def test_reference_rounds_all_four_binary64_modes(self):
         half_ulp = Fraction(1, 1 << 53)
         self.assertEqual(fd.round_fraction(Fraction(1) + half_ulp, 0), 0x3FF0000000000000)
@@ -97,12 +105,40 @@ class F64DiffTests(unittest.TestCase):
         # the translator now gives the ISA's signed infinity for NaN(S0) too (#4536 was written when it kept the NaN)
         self.assertEqual(known[0], "match")
 
+    def test_div_fixup_reference_agrees_with_the_translator_at_the_cutoffs(self):
+        # biased exponents (S1, S2) around the underflow cutoff and past the old overflow one
+        for e1, e2 in ((1075, 1), (1076, 1), (1077, 1), (1, 1024), (1, 1025), (520, 1736), (1, 2046)):
+            with self.subTest(e1=e1, e2=e2), tempfile.TemporaryDirectory() as tmp:
+                status, reason, want, got = fd.run_one([
+                    "v_mov_b32 v12, 0x22d1754f", "v_mov_b32 v13, 0x7ee2a522",
+                    "v_mov_b32 v14, 0", f"v_mov_b32 v15, {e1 << 20:#x}",
+                    "v_mov_b32 v16, 0", f"v_mov_b32 v17, {e2 << 20:#x}",
+                    "v_div_fixup_f64 v[8:9], v[12:13], v[14:15], v[16:17]"], "ps_f64_fixup_cutoff", tmp)
+                self.assertEqual(status, "match", (reason, want, got))
+
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
                    "v_cmp_class_f64_e64 s20, v[12:13], 0x3ff"):
             result = fd.ref_program(["v_mov_b32 v8, 0x12345678", "v_mov_b32 v12, 0x00000000",
                                      "v_mov_b32 v13, 0x3ff00000", op])
             self.assertEqual(result[0], 0x12345678)
+
+    def test_hw_oracle_reference_starts_with_one_lane_in_exec(self):
+        # The hardware kernel is one lane, so a v_cmpx that hits leaves EXEC = 1 and `s_mov_b32 s22, exec_lo` reads 1;
+        # the all-lanes reference said 0xffffffff, so every v_cmpx case was a false mismatch on --oracle hw. The
+        # words are what gfx1036 returned for this program (RDNA2 iGPU, Windows driver 32.0.21045.16010).
+        lines = ["s_mov_b32 s6, 0x66466f79", "s_mov_b32 s7, 0x2df96874",
+                 "v_mov_b32 v8, 0x1081490d", "v_mov_b32 v9, 0xfdeb0203",
+                 "v_mov_b32 v10, 0xa1ef942f", "v_mov_b32 v11, 0xfedbc06e",
+                 "s_mov_b32 s10, exec_lo", "v_cmpx_lt_f64_e64 0xc83d5d11, |s[6:7]|",
+                 "s_mov_b32 s22, exec_lo", "s_mov_b32 exec_lo, s10", "v_mov_b32 v9, s22",
+                 "v_cmp_lt_f64_e64 s20, 0xc83d5d11, |s[6:7]|", "v_cndmask_b32_e64 v8, 0, 1, s20"]
+        hardware = [0x00000001, 0x00000001, 0xA1EF942F, 0xFEDBC06E]
+        with tempfile.TemporaryDirectory() as tmp:
+            status, _, _, _ = fd.run_one(lines, "ps_f64_hw_exec", tmp, "hw", hw_words=hardware)
+        self.assertEqual(status, "match")
+        self.assertEqual(fd.ref_program(lines)[1], 0xFFFFFFFF)    # the translator's all-lanes view is unchanged
+        self.assertEqual(fd.ref_program(lines, exec_lo=1)[1], 1)
 
     def test_shrink_reuses_prepared_gpu_context(self):
         context = {"exe": "fake"}
@@ -201,9 +237,9 @@ class F64DiffTests(unittest.TestCase):
             ("sign_out_negative_from_s1", three, self.NEG2, one, three | self.NZ),
             ("sign_out_positive_both_negative", self.NEG3, self.NEG2, self.NEG1, three),
             ("sign_out_clears_s0_sign", self.NEG3, one, one, three),
-            ("nan_s2_quiets_s2", one, one, self.SNAN, 0x7FF8000000000001),
+            ("nan_s2_passes_unquieted", one, one, self.SNAN, self.SNAN),
             ("nan_s2_beats_nan_s1", one, self.SNAN, qn2, qn2),
-            ("nan_s1_quiets_s1", one, self.SNAN, one, 0x7FF8000000000001),
+            ("nan_s1_passes_unquieted", one, self.SNAN, one, self.SNAN),
             ("nan_s2_beats_zero_over_zero", one, self.PZ, qn2, qn2),
             ("zero_over_zero", one, self.PZ, self.NZ, 0xFFF8000000000000),
             ("inf_over_inf", one, self.PINF, self.NINF, 0xFFF8000000000000),
@@ -214,11 +250,11 @@ class F64DiffTests(unittest.TestCase):
             ("inf_over_y", one, self.NEG2, self.NINF, self.PINF),
             ("nan_s0_to_signed_inf_isa_rule", self.QNAN, one, one, self.PINF),
             ("nan_s0_to_signed_inf_negative", self.QNAN, self.NEG2, one, self.NINF),
-            ("underflow_edge_still_passes_s0", three, e(1075), e(1), three),
-            ("underflow_to_zero", three, e(1076), e(1), self.PZ),
-            ("underflow_beats_nan_s0", self.QNAN, e(1076), e(1), self.PZ),
-            ("overflow_edge_still_passes_s0", three, e(1), e(1024), three),
-            ("overflow_to_inf", three, e(1), e(1025), self.PINF),
+            ("underflow_edge_still_passes_s0", three, e(1076), e(1), three),
+            ("underflow_to_zero", three, e(1077), e(1), self.PZ),
+            ("underflow_beats_nan_s0", self.QNAN, e(1077), e(1), self.PZ),
+            ("no_overflow_cutoff_at_1024", three, e(1), e(1025), three),
+            ("no_overflow_cutoff_at_the_widest", three, e(1), e(2046), three),
         ]
         for name, s0, s1, s2, want in table:
             with self.subTest(case=name):
@@ -288,7 +324,7 @@ class F64DiffTests(unittest.TestCase):
                     out.append(self.reason)
                     continue
                 try:
-                    words = fd.ref_program(kernel.lines[:-3], True)   # drop the store epilogue
+                    words = fd.ref_program(kernel.lines[:-3], True, exec_lo=1)   # drop the store epilogue; one lane, EXEC = 1
                 except (fd.SkipCase, ArithmeticError, IndexError, KeyError, ValueError):
                     out.append("assembler rejected: fake")
                     continue

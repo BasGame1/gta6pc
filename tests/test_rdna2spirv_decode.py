@@ -230,14 +230,8 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         self.gen.decode_format(words, 7, fixed=False)
         self.assertEqual(len(self.gen.tbuffer_norm_fns), fns_count)
 
-    def test_decode_any_format_selection(self):
-        words = ["%w0", "%w1", "%w2", "%w3"]
-        initial_lines = len(self.gen.body)
-        comps = self.gen.decode_any_format("%run_fmt", words)
-        self.assertEqual(len(comps), 4)
-        emitted = "\n".join(self.gen.body[initial_lines:])
-        self.assertIn("OpIEqual %bool %run_fmt", emitted)
-        self.assertIn("OpSelect %uint", emitted)
+    # decode_any_format (one OpIEqual/OpSelect per format code) went away with SHADER-849's table decode;
+    # tests/semantic/test_format_decode_table.py checks that path, and format_decode_call is checked below.
 
     def test_format_decode_call_builds_and_caches_function(self):
         words = ["%w0", "%w1", "%w2", "%w3"]
@@ -392,7 +386,10 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
         export = [0x0F, 0x18, 0x00, 0xF8, 0x00, 0x01, 0x00, 0x01]
         endpgm = [0x00, 0x00, 0x81, 0xBF]
-        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # the word from the finding, as llvm-mc leaves it
+        # The word of the finding was [0x00,0x50,0x16,0xCC, 0x01,0x05,0x0E,0x0C]; the translator recovers that one
+        # v_dot4_i32_i8 form from the program's words now (restore_skipped_instructions), so it is no longer a gap.
+        # This is the same instruction with another op_sel, which is not recovered and stays skipped.
+        gap = [0x00, 0x58, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)
@@ -427,7 +424,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         # code range the header declares, so the path runs into them as well
         mov0 = [0xF2, 0x02, 0x00, 0x7E]
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
-        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
+        gap = [0x00, 0x58, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # a form that is not recovered, as above
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)

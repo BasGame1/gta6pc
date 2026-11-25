@@ -41,7 +41,7 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
   number:
 
   ```sh
-  gh issue list -R ItsNotRexed/Leonida --state open --search "Coordinating who works on what in:title"
+  gh issue list -R ubiquitarianism/leonida --state open --search "Coordinating who works on what in:title"
   ```
 
   With no `gh` auth, the search link in [CONTRIBUTING.md](CONTRIBUTING.md) works in a browser; say so when you cannot
@@ -54,8 +54,13 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
   Post it in the coordination issue as `finding: <one line>`, followed by where it is (file and line), why it matters,
   and whether it needs game files or particular hardware. The coordinator checks it and lists it for others.
 - For the D3D12 → Vulkan layer (`runtime/shims/d3d12_*`, `runtime/src/vulkan_*`), also read
-  [#313](https://github.com/ItsNotRexed/Leonida/issues/313): most of that work builds on a few open pull requests,
-  and it lists which D3D12 methods are still open.
+  [docs/d3d12_vulkan.md](docs/d3d12_vulkan.md) and the open pull requests: most of that work builds on a few of
+  them. The page that tracked it, #313, was in the original repository and is gone.
+- The original repository (`ItsNotRexed/Leonida`) went private on 23 November 2026. A `#N` written before that is
+  an old number and links nowhere: do not cite one as if it could be read, and do not run `gh` against that
+  repository. The old open issues are indexed by title in
+  [#18](https://github.com/ubiquitarianism/leonida/issues/18) and the old open pull requests are kept as
+  `old-pr/<old number>` branches ([#17](https://github.com/ubiquitarianism/leonida/issues/17)).
 
 ## Before you guess, look
 
@@ -65,9 +70,9 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
 ## Test without the game first
 
-None of these need game files. Most run in seconds - the translator suite takes a few minutes (433 files and 5 821
-tests in 224 s on 16 cores) and the two builds longer - so run one translator test file while you iterate and the
-whole suite once before the pull request:
+None of these need game files. Most run in seconds - the translator suite takes a few minutes (465 files and 6 108
+tests in 297 s on 16 cores on Windows 11) and the two builds longer - so run one translator test file while you
+iterate and the whole suite once before the pull request:
 
 ```powershell
 python -m compileall -q make_game.py tools tests

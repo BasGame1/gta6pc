@@ -8,7 +8,7 @@ import spirv_asm
 
 class MeshAllocSingleWriterTests(unittest.TestCase):
     def test_ms_alloc_req_single_writer_guard(self):
-        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) stores %ms_counts atomically to avoid data races."""
+        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) uses OpAtomicStore %ms_counts so any wave can allocate race-free."""
         for mesh_compute in (False, True):
             orig_mc = rdna2spirv.MESH_COMPUTE
             try:
@@ -24,27 +24,25 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
                 gen._insn(ins)
 
                 body_text = "\n".join(gen.body)
-                # 1. OpAtomicStore %ms_counts must be present
-                self.assertIn("OpAtomicStore %ms_counts", body_text)
+                # 1. Must use OpAtomicStore %ms_counts (Workgroup scope 2, Relaxed semantics 0)
+                self.assertRegex(body_text, r"OpAtomicStore %ms_counts %c2 %c0 %\w+")
+                # 2. Must not emit a racy plain OpStore %ms_counts or restrict to local_index == 0
+                self.assertNotIn("OpStore %ms_counts", body_text)
+                self.assertNotIn("%local_index", body_text)
 
-                # 2. Verify assembly into a complete module passes spirv_asm
-                # Build mock header
+                # 3. Verify assembly into a complete module passes spirv_asm
                 types_and_vars = [
                     "OpCapability Shader",
                     "OpCapability MeshShadingEXT" if not mesh_compute else "",
                     "OpMemoryModel Logical GLSL450",
-                    'OpEntryPoint GLCompute %main "main" %local_index' if mesh_compute else 'OpEntryPoint MeshEXT %main "main" %local_index',
+                    'OpEntryPoint GLCompute %main "main"' if mesh_compute else 'OpEntryPoint MeshEXT %main "main"',
                     "OpExecutionMode %main LocalSize 128 1 1",
-                    "OpDecorate %local_index BuiltIn LocalInvocationIndex",
                     "%void = OpTypeVoid",
-                    "%bool = OpTypeBool",
                     "%uint = OpTypeInt 32 0",
                     "%c0 = OpConstant %uint 0",
                     "%c2 = OpConstant %uint 2",
-                    "%_ptr_Input_uint = OpTypePointer Input %uint",
                     "%_ptr_Workgroup_uint = OpTypePointer Workgroup %uint",
                     "%_ptr_Function_uint = OpTypePointer Function %uint",
-                    "%local_index = OpVariable %_ptr_Input_uint Input",
                     "%ms_counts = OpVariable %_ptr_Workgroup_uint Workgroup",
                     "%m0 = OpVariable %_ptr_Function_uint Function",
                     "%fn_t = OpTypeFunction %void",

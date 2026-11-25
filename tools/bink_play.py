@@ -84,22 +84,27 @@ def load_names(archive, mount, use_cache=True):
         tmp.unlink(missing_ok=True)
     if use_cache:
         fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
-        with open(fd, "w", encoding="utf-8", newline="") as f:
-            f.write("# " + key + "\n")
-            w = csv.writer(f, lineterminator="\n")
-            w.writerow(CACHE_FIELDS)
-            for r in rows:
-                w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
-        os.replace(name, cache)
+        try:
+            with open(fd, "w", encoding="utf-8", newline="") as f:
+                f.write("# " + key + "\n")
+                w = csv.writer(f, lineterminator="\n")
+                w.writerow(CACHE_FIELDS)
+                for r in rows:
+                    w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
+            os.replace(name, cache)
+        finally:
+            Path(name).unlink(missing_ok=True)
     return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in rows]
 
 
 def pick(names, wanted):
-    """The one entry whose path is ``wanted`` (case-insensitive), else the one that contains it."""
+    """Prefer exact paths to substring matches and return a hit only when unique."""
     w = wanted.replace("\\", "/").lower()
     exact = [n for n in names if n[0].lower() == w]
-    if exact:
+    if len(exact) == 1:
         return exact[0], []
+    if exact:
+        return None, exact
     part = [n for n in names if w in n[0].lower()]
     if len(part) == 1:
         return part[0], []

@@ -12,9 +12,10 @@ a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a
 tag is accepted too. The reader accepts UTF-8 and BOM-marked UTF-16, including PowerShell 5.1 stderr redirection.
 
 Usage:
-    python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
+    python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--counts-only] [--limit N]
 
-The traces can quote what the game prints, so they stay on the player's machine: the text report counts debug
+Use --counts-only for an aggregate JSON report to share. The traces can quote what the game prints, so they
+stay on the player's machine. The text report counts debug
 strings instead of printing them, and only the tests' synthetic fixtures go into the repository. Share counts and
 error classes from a real run, not its trace (AGENTS.md, "No game data").
 
@@ -31,6 +32,14 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+PACING_LINE = re.compile(
+    r"^(?:.+ : )?\[rt\] present: pacing summary "
+    r"frames=(\d+) samples=(\d+) target_us=(\d+) mean_us=(-?\d+(?:\.\d+)?) drift_us=([+-]?\d+(?:\.\d+)?) "
+    r"p50_us=(\d+) p95_us=(\d+) p99_us=(\d+) "
+    r"latency_samples=(\d+) latency_p50_us=(\d+) latency_p95_us=(\d+) latency_p99_us=(\d+)\s*$"
+)
+D3D12_PROBLEMS = ("failed", "unsupported", "refused", "partial")
+D3D12_OUTCOMES = frozenset((*D3D12_PROBLEMS, "called", "ok", "ignored"))
 
 
 class TraceError(ValueError):
@@ -62,16 +71,17 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "dllmain": {"ok": 0, "failed": 0, "failed_modules": []},
         "unimplemented": [],
         "unimplemented_by_dll": {},
+        "unimplemented_call_counts": {},
         "debug_strings": 0,
         "file_open_failed": [],
         "file_open_failed_count": 0,
         "int3_skipped": [],
         "exceptions": [],
         "exception_count": 0,
+        "xmem_physical_pages": [],
         "exit": None,
         "error": None,
     }
-    seen_imports = set()
     with _open_text(path) as fh:
         for number, line in enumerate(fh, 1):
             line = line.strip()
@@ -121,8 +131,9 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                         trace["dllmain"]["failed_modules"].append(event.get("module"))
             elif kind == "unimplemented_call":
                 name = str(event.get("import", "?"))
-                if name not in seen_imports:
-                    seen_imports.add(name)
+                calls = trace["unimplemented_call_counts"]
+                calls[name] = calls.get(name, 0) + 1
+                if calls[name] == 1:
                     trace["unimplemented"].append(
                         {"import": name, "caller": event.get("caller")}
                     )
@@ -161,6 +172,30 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     trace["exceptions"].append(detail)
                 else:
                     trace["exceptions"][-1] = detail
+            elif kind == "xmem_physical_pages":
+                samples = trace["xmem_physical_pages"]
+                if len(samples) < limit:
+                    attributes = event.get("attributes")
+                    pages = event.get("pages")
+                    record = {
+                        "attributes": (
+                            attributes
+                            if isinstance(attributes, str) and re.fullmatch(r"0x[0-9a-fA-F]{1,16}", attributes)
+                            else None
+                        ),
+                        "pages": pages if type(pages) is int and 0 <= pages < (1 << 64) else None,
+                    }
+                    for key in ("api", "caller"):
+                        value = event.get(key)
+                        record[key] = (
+                            value
+                            if isinstance(value, str)
+                            and bool(value.strip())
+                            and not any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F or ch in ("\u2028", "\u2029")
+                                        for ch in value)
+                            else None
+                        )
+                    samples.append(record)
             elif kind == "exit":
                 trace["exit"] = event.get("code")
             elif kind == "error":
@@ -179,6 +214,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "outcomes": {},
         "methods": [],
         "first": {},
+        "method_outcomes": {},
         "failed": [],
         "unsupported": [],
         "refused": [],
@@ -186,11 +222,32 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "last_seq": 0,
         "sequence_break_count": 0,
         "sequence_breaks": [],
+        "frame_pacing": None,
     }
     with _open_text(path) as fh:
         for line in fh:
-            match = D3D12_LINE.match(line.rstrip("\n"))
-            if not match:
+            stripped = line.rstrip("\n")
+            pacing_match = PACING_LINE.match(stripped)
+            if pacing_match:
+                trace["frame_pacing"] = {
+                    "frames": int(pacing_match.group(1)),
+                    "samples": int(pacing_match.group(2)),
+                    "target_us": int(pacing_match.group(3)),
+                    "mean_us": float(pacing_match.group(4)),
+                    "drift_us": float(pacing_match.group(5)),
+                    "p50_us": int(pacing_match.group(6)),
+                    "p95_us": int(pacing_match.group(7)),
+                    "p99_us": int(pacing_match.group(8)),
+                    "latency_samples": int(pacing_match.group(9)),
+                    "latency_p50_us": int(pacing_match.group(10)),
+                    "latency_p95_us": int(pacing_match.group(11)),
+                    "latency_p99_us": int(pacing_match.group(12)),
+                }
+                continue
+            match = D3D12_LINE.match(stripped)
+            # A crash can truncate the final outcome. A known complete outcome is
+            # still usable when the trace ends just before the newline.
+            if not match or (not line.endswith("\n") and match.group(3) not in D3D12_OUTCOMES):
                 if line.strip():
                     trace["ignored_lines"] += 1
                 continue
@@ -203,10 +260,12 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
                     trace["sequence_breaks"].append({"expected": expected, "observed": seq})
             trace["last_seq"] = seq
             trace["outcomes"][outcome] = trace["outcomes"].get(outcome, 0) + 1
+            counts = trace["method_outcomes"].setdefault(method, {})
+            counts[outcome] = counts.get(outcome, 0) + 1
             if method not in trace["first"]:
                 trace["methods"].append(method)
                 trace["first"][method] = {"seq": seq, "outcome": outcome}
-            if outcome in ("failed", "unsupported", "refused", "partial"):
+            if outcome in D3D12_PROBLEMS:
                 bucket = trace[outcome]
                 if len(bucket) < limit:
                     bucket.append({"seq": seq, "method": method})
@@ -215,6 +274,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             f"{path} has no [d3d12-trace] line among {trace['ignored_lines']} line(s); "
             "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
         )
+    trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
     return trace
 
 
@@ -222,9 +282,43 @@ def summarize(startup: dict | None, d3d12: dict | None) -> dict:
     return {"startup": startup, "d3d12": d3d12}
 
 
+def counts_only(summary: dict) -> dict:
+    """Project only fixed counters into the summary intended for sharing."""
+    counters = summarize(None, None)
+    if startup := summary["startup"]:
+        counters["startup"] = {
+            name: startup[name] for name in ("events", "bad_lines", "tls_callbacks", "debug_strings",
+                                             "file_open_failed_count", "exception_count")
+        }
+        counters["startup"].update(
+            modules=len(startup["modules"]),
+            dllmain_failed=startup["dllmain"]["failed"],
+            unimplemented_imports=len(startup["unimplemented"]),
+            int3_skipped=len(startup["int3_skipped"]),
+            xmem_physical_pages_count=startup["kinds"].get("xmem_physical_pages", 0),
+            exit_observed=startup["exit"] is not None,
+        )
+    if d3d12 := summary["d3d12"]:
+        outcomes = {}
+        for outcome, count in d3d12["outcomes"].items():
+            key = outcome if outcome in ("failed", "unsupported", "refused", "partial", "ok", "called", "ignored") else "other"
+            outcomes[key] = outcomes.get(key, 0) + count
+        counters["d3d12"] = {
+            "calls": d3d12["calls"],
+            "ignored_lines": d3d12["ignored_lines"],
+            "sequence_break_count": d3d12["sequence_break_count"],
+            "outcomes": outcomes,
+        }
+        if d3d12.get("frame_pacing") is not None:
+            counters["d3d12"]["frame_pacing"] = dict(d3d12["frame_pacing"])
+    return counters
+
+
 def _tail(items, limit: int) -> str:
-    shown = ", ".join(str(x) for x in items[:limit])
-    return shown + (f", ... {len(items) - limit} more" if len(items) > limit else "")
+    shown = [str(x) for x in items[:limit]]
+    if len(items) > limit:
+        shown.append(f"... {len(items) - limit} more")
+    return ", ".join(shown)
 
 
 def format_text(summary: dict, limit: int) -> str:
@@ -239,7 +333,8 @@ def format_text(summary: dict, limit: int) -> str:
             kinds = ", ".join(f"{k} {v}" for k, v in sorted(startup["kinds"].items()))
             out.append(f"  kinds: {kinds}")
         if startup["modules"]:
-            names = [m["module"] for m in startup["modules"]]
+            # A relocated module is marked: triage step 1 asks whether the executable sits at its preferred base.
+            names = [m["module"] + (" (relocated)" if m.get("relocated") else "") for m in startup["modules"]]
             out.append(f"  modules ({len(names)}): {_tail(names, limit)}")
         out.append(f"  tls callbacks: {startup['tls_callbacks']}")
         if callback := startup.get("last_tls_callback"):
@@ -255,9 +350,11 @@ def format_text(summary: dict, limit: int) -> str:
             line += f" ({_tail(dm['failed_modules'], limit)})"
         out.append(line)
         if startup["unimplemented"]:
-            out.append(f"  unimplemented: {len(startup['unimplemented'])} unique")
-            for item in startup["unimplemented"][:limit]:
-                out.append(f"    {item['import']} from {item['caller']}")
+            calls = startup["unimplemented_call_counts"]
+            out.append(f"  unimplemented: {len(calls)} unique, {sum(calls.values())} calls")
+            for item in sorted(startup["unimplemented"], key=lambda item: -calls[item["import"]])[:limit]:
+                count = calls[item["import"]]
+                out.append(f"    {item['import']} from {item['caller']} ({count} {'call' if count == 1 else 'calls'})")
             if len(startup["unimplemented"]) > limit:
                 out.append(f"    ... {len(startup['unimplemented']) - limit} more")
             by_dll = ", ".join(
@@ -290,6 +387,17 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(f"    code {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
+        if count := startup["kinds"].get("xmem_physical_pages"):
+            out.append(f"  XMem physical page observations: {count}")
+            shown = startup.get("xmem_physical_pages", [])[:limit]
+            for item in shown:
+                pages = item["pages"] if item["pages"] is not None else "?"
+                out.append(
+                    f"    {item['api'] or '?'} attributes {item['attributes'] or '?'}"
+                    f" requested {pages} pages from {item['caller'] or '?'}"
+                )
+            if len(shown) < count:
+                out.append(f"    ... {count - len(shown)} more")
         if startup["error"]:
             out.append(f"  error: {startup['error']}")
         if startup["exit"] is not None:
@@ -303,12 +411,35 @@ def format_text(summary: dict, limit: int) -> str:
             " (the [rt] diagnostics are not summarized)"
             + (f": {outcomes}" if outcomes else "")
         )
+        if fp := d3d12.get("frame_pacing"):
+            line = (
+                f"  frame pacing: {fp['frames']} frame(s), {fp['samples']} interval(s), "
+                f"target {fp['target_us']} us, mean {fp['mean_us']:.1f} us (drift {fp['drift_us']:+.1f} us), "
+                f"p50/p95/p99 {fp['p50_us']}/{fp['p95_us']}/{fp['p99_us']} us"
+            )
+            if fp["latency_samples"]:
+                line += (
+                    f"; origin-to-present p50/p95/p99 "
+                    f"{fp['latency_p50_us']}/{fp['latency_p95_us']}/{fp['latency_p99_us']} us"
+                )
+            out.append(line)
+        if last_call := d3d12.get("last_call"):
+            out.append(f"  last recorded call: #{last_call['seq']} {last_call['method']} {last_call['outcome']}")
         if d3d12["sequence_break_count"]:
             out.append(f"  sequence breaks: {d3d12['sequence_break_count']}")
             for item in d3d12["sequence_breaks"][:limit]:
                 out.append(f"    expected #{item['expected']}, observed #{item['observed']}")
         if d3d12["methods"]:
             out.append(f"  first per method: {_tail(d3d12['methods'], limit)}")
+        problems = []
+        for method, counts in d3d12["method_outcomes"].items():
+            failures = {outcome: counts[outcome] for outcome in D3D12_PROBLEMS if outcome in counts}
+            if failures:
+                problems.append((sum(failures.values()), method, failures))
+        if problems:
+            out.append("  methods by problem count:")
+            for _, method, counts in sorted(problems, key=lambda row: (-row[0], row[1]))[:limit]:
+                out.append(f"    {method}: " + ", ".join(f"{outcome} {n}" for outcome, n in counts.items()))
         if d3d12["unsupported"]:
             unsupported = [f"#{c['seq']} {c['method']}" for c in d3d12["unsupported"]]
             out.append(f"  unsupported: {_tail(unsupported, limit)}")
@@ -331,15 +462,16 @@ def main(argv=None) -> int:
     ap.add_argument("startup", nargs="?", help="the JSONL written by gta6rt --trace")
     ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
+    ap.add_argument("--counts-only", action="store_true", help="print aggregate JSON without paths or event details")
     ap.add_argument(
-        "--limit", type=int, default=10, help="items listed per section (default 10)"
+        "--limit", type=int, default=10, help="items listed per section (default 10; 0 omits XMem observation lists)"
     )
     a = ap.parse_args(argv)
     if not a.startup and not a.d3d12:
         print("error: give the startup trace, --d3d12, or both", file=sys.stderr)
         return 2
-    if a.limit < 1:
-        print("error: --limit must be at least 1", file=sys.stderr)
+    if a.limit < 0:
+        print("error: --limit must be non-negative", file=sys.stderr)
         return 2
     summary = summarize(None, None)
     exit_code = 0
@@ -348,11 +480,13 @@ def main(argv=None) -> int:
             try:
                 summary[section] = parse(path, a.limit)
             except TraceError as e:
-                print(f"error: {e}", file=sys.stderr)
+                print(f"error: {section} trace unavailable" if a.counts_only else f"error: {e}", file=sys.stderr)
                 exit_code = 2
     if not any(summary.values()):
         return 2
-    if a.json:
+    if a.counts_only:
+        print(json.dumps(counts_only(summary), indent=1))
+    elif a.json:
         print(json.dumps(summary, indent=1))
     else:
         print(format_text(summary, a.limit))

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -18,6 +19,7 @@
 namespace rt::shims {
 long xgameruntime_offline_game_events();
 long xgameruntime_user_open_handles();
+long xgameruntime_offline_device_registrations(uint32_t kind);
 }
 
 namespace {
@@ -73,7 +75,16 @@ constexpr GUID kAccessibilityClass = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0
 constexpr GUID kAccessibility2 = {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
 constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
 
-using EnumVoices = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
+struct VoiceInformation {   // XSpeechSynthesizerVoiceInformation, the GDK reference's member order
+    const char* description;
+    const char* display_name;
+    uint32_t gender;
+    const char* voice_id;
+    const char* language;
+};
+using VoiceCallback = bool(CALLBACK*)(const VoiceInformation*, void*);
+using EnumVoices = HRESULT(STDMETHODCALLTYPE*)(void*, void* context, VoiceCallback callback);
+using SetCustomVoice = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*);
 using SpeechCreate = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
 using SpeechClose = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
 using SpeechStream = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*, void**);
@@ -91,6 +102,102 @@ void* user_object(HRESULT(WINAPI* query)(const GUID*, REFIID, void**)) {
 }
 
 void CALLBACK on_state(void*, uint64_t, uint32_t) {}
+
+struct VoicesSeen {
+    int count = 0;
+    std::string voice_id;
+    std::string language;
+};
+bool CALLBACK on_voice(const VoiceInformation* info, void* context) {
+    auto* seen = static_cast<VoicesSeen*>(context);
+    ++seen->count;
+    seen->voice_id = info && info->voice_id ? info->voice_id : "";
+    seen->language = info && info->language ? info->language : "";
+    return true;
+}
+
+// XUserDeviceImpl slots 4/5 (device association) and 7/8 (default audio endpoint): kept until unregistered, never
+// called back offline.
+long g_device_callbacks = 0;
+void CALLBACK on_association_changed(void* context, const void*) {
+    ++g_device_callbacks;
+    if (context) ++*static_cast<long*>(context);
+}
+void CALLBACK on_audio_endpoint_changed(void* context, uint64_t, uint32_t, const wchar_t*) {
+    ++g_device_callbacks;
+    if (context) ++*static_cast<long*>(context);
+}
+
+constexpr uint32_t kAssociation = 0, kAudioEndpoint = 1;   // rt::shims::xgameruntime_offline_device_registrations
+
+void check_device_registrations(void* device) {
+    using rt::shims::xgameruntime_offline_device_registrations;
+    auto reg = [&](int slot, XTaskQueueHandle queue, void* context, void* callback, XTaskQueueRegistrationToken* t) {
+        return at<Register>(device, slot)(device, queue, context, callback, t);
+    };
+    auto unreg = [&](int slot, XTaskQueueRegistrationToken t, bool wait) {
+        return at<Unregister>(device, slot)(device, t, wait);
+    };
+    void* association = reinterpret_cast<void*>(&on_association_changed);
+    void* audio = reinterpret_cast<void*>(&on_audio_endpoint_changed);
+
+    XTaskQueueRegistrationToken t{};
+    check(reg(4, nullptr, nullptr, nullptr, &t) == E_INVALIDARG && reg(4, nullptr, nullptr, association, nullptr) ==
+              E_INVALIDARG && reg(7, nullptr, nullptr, nullptr, &t) == E_INVALIDARG &&
+              reg(7, nullptr, nullptr, audio, nullptr) == E_INVALIDARG,
+          "device registrations need a callback and a token (E_INVALIDARG)");
+    check(xgameruntime_offline_device_registrations(kAssociation) == 0 &&
+              xgameruntime_offline_device_registrations(kAudioEndpoint) == 0,
+          "a refused device registration is not kept");
+
+    // queue and context are optional; one registration of each kind on a manual queue the test dispatches.
+    XTaskQueueHandle manual = nullptr;
+    check(SUCCEEDED(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &manual)),
+          "create a manual queue for the device callbacks");
+    long calls = 0;
+    XTaskQueueRegistrationToken a1{}, a2{}, e1{}, e2{};
+    check(reg(4, nullptr, nullptr, association, &a1) == S_OK && reg(4, manual, &calls, association, &a2) == S_OK &&
+              reg(7, nullptr, nullptr, audio, &e1) == S_OK && reg(7, manual, &calls, audio, &e2) == S_OK,
+          "device association and audio endpoint registrations succeed with or without a queue and context");
+    const uint64_t tokens[] = {a1.token, a2.token, e1.token, e2.token};
+    bool distinct = true;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) distinct = distinct && tokens[i] != 0 && (i == j || tokens[i] != tokens[j]);
+    check(distinct, "device registration tokens are non-zero and unique across both kinds");
+    check(xgameruntime_offline_device_registrations(kAssociation) == 2 &&
+              xgameruntime_offline_device_registrations(kAudioEndpoint) == 2,
+          "each device registration is kept under its token");
+
+    check(!XTaskQueueDispatch(manual, XTaskQueuePort::Work, 0) &&
+              !XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0),
+          "nothing is queued for a device registration offline");
+    // The title closing its own queue handle doesn't end a registration: the shim keeps its own reference.
+    XTaskQueueCloseHandle(manual);
+    check(xgameruntime_offline_device_registrations(kAssociation) == 2,
+          "a registration outlives the title's handle to its queue");
+
+    // A token of the other kind, one never handed out, or 0: unregistering is harmless (true) and removes nothing.
+    check(unreg(5, e1, true) && unreg(8, a1, false) && unreg(5, XTaskQueueRegistrationToken{0}, false) &&
+              unreg(8, XTaskQueueRegistrationToken{~0ull}, true),
+          "unregistering a foreign, unissued or zero token returns true");
+    check(xgameruntime_offline_device_registrations(kAssociation) == 2 &&
+              xgameruntime_offline_device_registrations(kAudioEndpoint) == 2,
+          "and leaves every registration in place");
+
+    // Unregistering removes the registration at once, with or without wait (nothing is ever pending).
+    check(unreg(5, a1, false) && xgameruntime_offline_device_registrations(kAssociation) == 1,
+          "XUserUnregisterForDeviceAssociationChanged (wait = false) removes its registration");
+    check(unreg(5, a2, true) && xgameruntime_offline_device_registrations(kAssociation) == 0 &&
+              xgameruntime_offline_device_registrations(kAudioEndpoint) == 2,
+          "XUserUnregisterForDeviceAssociationChanged (wait = true) removes only its own");
+    check(unreg(8, e1, true) && unreg(8, e2, false) && xgameruntime_offline_device_registrations(kAudioEndpoint) == 0,
+          "XUserUnregisterForDefaultAudioEndpointUtf16Changed removes its registrations");
+    check(unreg(5, a1, true) && unreg(8, e2, false) && xgameruntime_offline_device_registrations(kAssociation) == 0 &&
+              xgameruntime_offline_device_registrations(kAudioEndpoint) == 0,
+          "a second unregister is harmless (true)");
+
+    check(g_device_callbacks == 0 && calls == 0, "no device association or audio endpoint callback ever ran");
+}
 
 }  // namespace
 
@@ -178,9 +285,7 @@ int main() {
     check(rt::shims::xgameruntime_user_open_handles() == 1, "the handle is an XUserHandle the title closes");
     at<CloseUser>(user_object(query), 4)(user_object(query), user);
     check(rt::shims::xgameruntime_user_open_handles() == 0, "XUserCloseHandle closes it");
-    check(at<Register>(device, 4)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == S_OK &&
-              at<Unregister>(device, 5)(device, token, false),
-          "device association registration and unregistration");
+    check_device_registrations(device);
     wchar_t endpoint[8] = {L'x'};
     size_t used = 99;
     check(FAILED(at<Endpoint>(device, 6)(device, 1, 0, 8, endpoint, &used)) && endpoint[0] == 0 && used == 0,
@@ -208,22 +313,55 @@ int main() {
           "XHighContrastGetMode reports Off");
     check(at<SetEnabled>(acc, 4)(acc, true) == S_OK, "XClosedCaptionSetEnabled is accepted");
     check(FAILED(at<NoArgs>(acc, 3)(acc)), "the closed-caption properties are not available offline");
-    check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
-              at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
-          "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
-    void* synth = reinterpret_cast<void*>(1);
-    check(at<SpeechCreate>(acc, 9)(acc, &synth) == E_FAIL && synth == nullptr,
-          "XSpeechSynthesizerCreate fails offline and nulls the handle");
-    void* stream = reinterpret_cast<void*>(1);
-    size_t size = 5, got = 5;
+    VoicesSeen seen;
+    check(at<EnumVoices>(acc, 8)(acc, &seen, &on_voice) == S_OK && seen.count == 1 &&
+              seen.voice_id == "leonida-silent" && seen.language == "en-US",
+          "XSpeechSynthesizerEnumerateInstalledVoices(context, callback): one silent voice, its context passed back");
+    check(at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
+          "XSpeechSynthesizerEnumerateInstalledVoices: a callback is required");
+    void* synth = nullptr;
+    check(at<SpeechCreate>(acc, 9)(acc, &synth) == S_OK && synth != nullptr &&
+              at<SpeechCreate>(acc, 9)(acc, nullptr) == E_POINTER,
+          "XSpeechSynthesizerCreate returns a silent synthesizer handle");
+    void* stream = nullptr;
+    size_t size = 0, got = 0;
     check(at<SpeechClose>(acc, 10)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 11)(acc, nullptr) == E_INVALIDARG &&
               at<SpeechClose>(acc, 12)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 14)(acc, nullptr) == E_INVALIDARG,
           "close and set-voice calls on a null handle: E_INVALIDARG");
+    check(at<SpeechClose>(acc, 11)(acc, synth) == S_OK, "XSpeechSynthesizerSetDefaultVoice succeeds on valid handle");
+    check(at<SetCustomVoice>(acc, 12)(acc, synth, seen.voice_id.c_str()) == S_OK &&
+              at<SetCustomVoice>(acc, 12)(acc, synth, "not-installed") == E_INVALIDARG &&
+              at<SetCustomVoice>(acc, 12)(acc, synth, nullptr) == E_INVALIDARG,
+          "XSpeechSynthesizerSetCustomVoice accepts the enumerated voice only");
     check(at<SpeechStream>(acc, 13)(acc, nullptr, "hi", &stream) == E_INVALIDARG && stream == nullptr,
           "CreateStreamFromText on a null synthesizer: E_INVALIDARG, no stream");
-    stream = reinterpret_cast<void*>(1);
-    check(at<SpeechStream>(acc, 21)(acc, nullptr, "<speak/>", &stream) == E_INVALIDARG && stream == nullptr,
-          "CreateStreamFromSsml on a null synthesizer: E_INVALIDARG, no stream");
+    check(at<SpeechStream>(acc, 13)(acc, synth, "Hello", &stream) == S_OK && stream != nullptr,
+          "CreateStreamFromText returns a silent WAVE stream");
+    check(at<StreamSize>(acc, 15)(acc, stream, &size) == S_OK && size == 44,
+          "GetStreamDataSize reports the 44-byte empty WAVE header");
+    uint8_t wav[64] = {};
+    check(at<StreamData>(acc, 16)(acc, stream, 8, wav, &got) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && got == 0,
+          "GetStreamData rejects an undersized buffer with ERROR_INSUFFICIENT_BUFFER");
+    check(at<StreamData>(acc, 16)(acc, stream, sizeof(wav), wav, &got) == S_OK && got == 44 &&
+              std::memcmp(wav, "RIFF", 4) == 0 && std::memcmp(wav + 8, "WAVEfmt ", 8) == 0 &&
+              std::memcmp(wav + 36, "data", 4) == 0,
+          "GetStreamData writes a valid silent 16 kHz mono 16-bit PCM WAVE header");
+    check(wav[40] == 0 && wav[41] == 0 && wav[42] == 0 && wav[43] == 0,
+          "the stream's data chunk is empty: no samples");
+    check(at<SpeechStream>(acc, 13)(acc, synth, "hi", nullptr) == E_POINTER,
+          "a stream call with no output handle: E_POINTER");
+    check(at<StreamSize>(acc, 15)(acc, stream, nullptr) == E_POINTER,
+          "the stream size with no output: E_POINTER");
+    check(at<StreamData>(acc, 16)(acc, stream, 43, wav, &got) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+              at<StreamData>(acc, 16)(acc, stream, sizeof(wav), nullptr, nullptr) ==
+                  HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "a buffer one byte smaller than the stream, or none: E_NOT_SUFFICIENT_BUFFER");
+    check(at<SpeechClose>(acc, 14)(acc, stream) == S_OK, "XSpeechSynthesizerCloseStreamHandle succeeds");
+    stream = nullptr;
+    check(at<SpeechStream>(acc, 21)(acc, synth, "<speak/>", &stream) == S_OK && stream != nullptr &&
+              at<SpeechClose>(acc, 14)(acc, stream) == S_OK,
+          "CreateStreamFromSsml returns a silent WAVE stream");
+    check(at<SpeechClose>(acc, 10)(acc, synth) == S_OK, "XSpeechSynthesizerCloseHandle succeeds");
     check(at<StreamSize>(acc, 15)(acc, nullptr, &size) == E_INVALIDARG && size == 0 &&
               at<StreamData>(acc, 16)(acc, nullptr, 8, nullptr, &got) == E_INVALIDARG && got == 0,
           "stream size and data on a null stream: E_INVALIDARG, zero written");
@@ -235,12 +373,21 @@ int main() {
     void* launcher = nullptr;
     check(query(&kLauncherClass, kLauncherClass, &launcher) == S_OK && launcher, "XLauncherImpl for its class id");
     if (!launcher) return 1;
-    void* deferral = reinterpret_cast<void*>(1);
+    void* deferral = nullptr;
+    using CloseDeferral = void(STDMETHODCALLTYPE*)(void*, void*);
     check(at<LaunchUri>(launcher, 3)(launcher, nullptr, "https://example.com") == E_FAIL,
           "XLaunchUri is not available offline");
-    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == E_FAIL && deferral == nullptr &&
-              at<NoArgs>(launcher, 5)(launcher) == E_FAIL,
-          "the display timeout deferral is not available offline");
+    check(at<AcquireDeferral>(launcher, 4)(launcher, nullptr) == E_POINTER,
+          "XDisplayAcquireTimeoutDeferral rejects null out pointer");
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == S_OK && deferral != nullptr,
+          "XDisplayAcquireTimeoutDeferral acquires a display power request handle");
+    void* second = nullptr;
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &second) == S_OK && second && second != deferral,
+          "concurrent display deferrals have distinct handles");
+    at<CloseDeferral>(launcher, 5)(launcher, second);
+    at<CloseDeferral>(launcher, 5)(launcher, deferral);
+    at<CloseDeferral>(launcher, 5)(launcher, nullptr);
+    check(true, "XDisplayCloseTimeoutDeferralHandle closes handle and ignores null");
     GUID other = kLauncherClass;
     other.Data1 ^= 1;
     void* none = reinterpret_cast<void*>(1);

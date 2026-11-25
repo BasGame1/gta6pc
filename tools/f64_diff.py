@@ -211,15 +211,17 @@ def compare(cond, a, b):
 
 
 def fixup(s0, s1, s2):
+    # Measured on gfx1036 under the game's MODE (docs/design.md, v_div_fixup row): a NaN source passes through
+    # unquieted, the underflow cutoff is exp(S2) - exp(S1) <= -1076 and there is no overflow cutoff.
     sign = (s1 ^ s2) & 0x8000000000000000
-    if is_nan(s2): return s2 | (1 << 51)
-    if is_nan(s1): return s1 | (1 << 51)
+    if is_nan(s2): return s2
+    if is_nan(s1): return s1
     z1, z2, i1, i2 = is_zero(s1), is_zero(s2), is_inf(s1), is_inf(s2)
     if (z1 and z2) or (i1 and i2): return 0xFFF8000000000000
     e1, e2 = (s1 >> 52) & 0x7FF, (s2 >> 52) & 0x7FF
     ediff = e2 - e1
-    if i1 or z2 or ediff < -1074: return sign
-    if z1 or i2 or ediff >= 1024 or is_nan(s0): return sign | EXP
+    if i1 or z2 or ediff <= -1076: return sign
+    if z1 or i2 or is_nan(s0): return sign | EXP
     return (s0 & 0x7FFFFFFFFFFFFFFF) | sign
 
 
@@ -259,10 +261,10 @@ def read_source(tok, vgpr, sgpr):
     elif tok.startswith(("v", "s")) and tok[1:].isdigit():
         raise HarnessError("binary64 source must be an even register pair")
     elif tok.startswith("0x"):
-        # A printed 32-bit ISA literal occupies bits 63:32 in forms marked by shader_ir;
-        # a full 64-bit hexadecimal operand is already the complete IEEE word.
+        # A printed 32-bit ISA literal occupies bits 63:32; a spelling of more than 8 hex digits is
+        # the whole binary64 value (the full-width form gen_source writes), as in the translator.
         value = int(tok, 16)
-        if value <= M32: value <<= 32
+        if len(tok) - 2 <= 8: value <<= 32
         value &= M64
     elif re.fullmatch(r"[-+]?\d+", tok):
         n = int(tok)
@@ -281,8 +283,8 @@ def parse_source_args(line):
     return bits[0], bits[1].rstrip(","), [x.strip() for x in args]
 
 
-def ref_program(lines, include_known=False):
-    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, M32
+def ref_program(lines, include_known=False, exec_lo=M32):
+    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, exec_lo
     for line in lines:
         s = line.strip()
         if not s or s.startswith((";", "exp ", "s_endpgm")): continue
@@ -348,7 +350,7 @@ def ref_program(lines, include_known=False):
             ediff = ((s2 >> 52) & 0x7FF) - ((s1 >> 52) & 0x7FF)
             normal_division = (not is_nan(s1) and not is_inf(s1) and not is_zero(s1)
                                and not is_nan(s2) and not is_inf(s2) and not is_zero(s2)
-                               and -1074 <= ediff < 1024)
+                               and ediff > -1076)
             if not include_known and is_nan(s0) and normal_division:
                 raise SkipCase(f"KNOWN_DIVERGENCE div-fixup-nan-s0: {KNOWN_DIVERGENCES['div-fixup-nan-s0']}")
             d = int(dst[2:-1].split(":")[0]); vgpr[d], vgpr[d + 1] = bits_to_words(fixup(*args))
@@ -629,7 +631,8 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
                 return "skip", f"KNOWN_DIVERGENCE fclamp-nan-zero: {KNOWN_DIVERGENCES['fclamp-nan-zero']}", None, None
             if line.split() and line.split()[0] in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fmas_f64") and ("|" in line or "-v[" in line or "-s[" in line):
                 return "skip", f"KNOWN_DIVERGENCE double-neg-abs: {KNOWN_DIVERGENCES['double-neg-abs']}", None, None
-    try: expected = ref_program(lines, include_known)
+    # The hardware kernel is one lane, so EXEC is 1 there and a program that reads exec_lo back sees 1.
+    try: expected = ref_program(lines, include_known, 1 if oracle == "hw" else M32)
     except SkipCase as exc: return "skip", str(exc), None, None
     except (ArithmeticError, IndexError, KeyError, ValueError) as exc:
         return "skip", f"reference limitation: {type(exc).__name__}: {exc}", None, None

@@ -54,11 +54,15 @@ struct Module {
     // the image's _tls_index. tls_index names TEB->ThreadLocalStoragePointer[tls_index], the array
     // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
     // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
+    // An executable gets index 0, as Windows gives the process EXE, because code built with /GA reads slot 0 without
+    // _tls_index. That needs reserve_tls_index0() at process start; without it, and for a second executable mapped
+    // while one holds index 0, the executable gets a helper index and a note on stderr, and its /GA code would use
+    // another module's TLS, so its code must not run (gta6rt refuses).
     // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
     // at DLL_THREAD_DETACH. A thread that was already running gets its copy from load() itself, as it would from
     // Windows for a DLL Windows loads: a block, no DLL_THREAD_ATTACH, and DLL_THREAD_DETACH when it ends.
     uint32_t tls_index = kNoTlsIndex;
-    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
+    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool ; 16 is index 0, an executable's
     uint64_t tls_generation = 0;       // unique token per TLS initialisation, distinguishing reused slots/addresses
     void* tls_block = nullptr;         // calling thread's copy of the image's template
     void* tls_saved_block = nullptr;   // helper DLL block replaced in that thread, restored by ~Loader
@@ -145,6 +149,10 @@ private:
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
+    // The compat-module step of resolve(): true when `key` (lower-case DLL name) is a file in compat_dir_, which then
+    // owns every import of that DLL; `out` is the export, or null when the DLL lacks it. Caller holds mutex_.
+    bool resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
+                        bool by_ordinal, void*& out);
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
@@ -152,6 +160,10 @@ private:
 
     mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
+    // LEONIDA_COMPAT_DIR, read when the Loader is made; empty = no compat step. Drop-in DLLs named like console
+    // modules (runtime/README.md, "Compat modules"), loaded by Windows from there and kept for the process lifetime.
+    std::filesystem::path compat_dir_;
+    std::map<std::string, void*> compat_modules_;  // lower-case DLL name -> HMODULE
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
@@ -173,6 +185,14 @@ private:
 // registers this with atexit; a caller that ends with ExitProcess must invoke it directly, because ExitProcess
 // skips the atexit table. Call it when no mapped code can run again: it unmaps the helper images.
 void cleanup_tls_clones();
+
+// Moves the runtime's own EXE off module TLS index 0, which Windows gave it, so that a mapped executable can have it
+// (Module::tls_index): its TLS moves to the index of one more helper clone, whose template is a copy of the EXE's.
+// Call it once at process start, before any other thread has run this EXE's code (gta6rt does it from a CRT
+// initializer): MSVC code keeps the address of its TLS slot across calls, so a thread that is already running cannot
+// be moved, and its TLS would stay at index 0. Returns false, with the reason in *why, when it cannot; later calls
+// return the first result.
+bool reserve_tls_index0(std::string* why = nullptr);
 
 std::string lower(std::string s);
 

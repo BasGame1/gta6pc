@@ -6,7 +6,9 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <vector>
 #include <cstring>
 #include <cstdint>
@@ -165,7 +167,7 @@ bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned dep
                           FLOAT depth_full, UINT8 stencil_full, FLOAT depth_part, UINT8 stencil_part,
                           std::vector<unsigned char>& depth_pixels, std::vector<unsigned char>& stencil_pixels,
                           D3D12_CLEAR_FLAGS full_flags = D3D12_CLEAR_FLAGS(0),
-                          D3D12_CLEAR_FLAGS part_flags = D3D12_CLEAR_FLAGS(0)) {
+                          D3D12_CLEAR_FLAGS part_flags = D3D12_CLEAR_FLAGS(0), bool part_no_flags = false) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -213,7 +215,8 @@ bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned dep
         static_cast<D3D12_CLEAR_FLAGS>((has_stencil ? D3D12_CLEAR_FLAG_STENCIL : 0) | D3D12_CLEAR_FLAG_DEPTH);
     list->ClearDepthStencilView(handle, full_flags ? full_flags : flags, depth_full, stencil_full, 0, nullptr);
     const D3D12_RECT rect{1, 1, 4, 3};
-    list->ClearDepthStencilView(handle, part_flags ? part_flags : flags, depth_part, stencil_part, 1, &rect);
+    list->ClearDepthStencilView(handle, part_no_flags ? D3D12_CLEAR_FLAGS(0) : (part_flags ? part_flags : flags),
+                                depth_part, stencil_part, 1, &rect);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = image.p;
@@ -373,14 +376,67 @@ bool check_unlisted_rtvs(ID3D12Device* device) {
 }
 } // namespace
 
+// ClearDepthStencilView values at the edge of what D3D12 accepts: on a D32_FLOAT target a depth outside [0, 1] and a
+// NaN are stored exactly as given by WARP; flags that name no plane clear nothing. On Vulkan the float values
+// can be preserved with unrestricted depth. Also check the legal [0, 1] clear values on a restricted device.
+bool check_depth_clear_edge_values(ID3D12Device* host, ID3D12Device* ours, bool unrestricted_depth) {
+    constexpr UINT width = 5, height = 3;
+    const auto read = [](ID3D12Device* device, FLOAT depth_full, FLOAT depth_part, bool part_no_flags,
+                         std::vector<unsigned char>& depth) {
+        std::vector<unsigned char> stencil;  // D32_FLOAT has no stencil plane
+        return clear_depth_and_read(device, DXGI_FORMAT_D32_FLOAT, 4, false, depth_full, 0, depth_part, 0, depth,
+                                    stencil, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAGS(0), part_no_flags);
+    };
+    const auto compare = [&](const char* what, FLOAT depth_full, FLOAT depth_part, bool part_no_flags, FLOAT outside,
+                             FLOAT inside) {
+        std::vector<unsigned char> expected, got;
+        if (!read(host, depth_full, depth_part, part_no_flags, expected)) return false;
+        if (!read(ours, depth_full, depth_part, part_no_flags, got)) return false;
+        CHECK(expected.size() == width * height * 4 && got.size() == expected.size());
+        size_t wrong = 0;
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x) {
+                const size_t at = (width * y + x) * 4;
+                const FLOAT want = (x >= 1 && x < 4 && y >= 1) ? inside : outside;
+                if (std::memcmp(expected.data() + at, &want, 4)) {
+                    FLOAT warp_value;
+                    std::memcpy(&warp_value, expected.data() + at, 4);
+                    std::fprintf(stderr, "%s (%u,%u): WARP cleared %g, expected %g\n", what, x, y, warp_value, want);
+                    ++wrong;
+                }
+                FLOAT want_layer = want;
+                if (!unrestricted_depth)
+                    want_layer = std::isnan(want) ? 0.0f : std::clamp(want, 0.0f, 1.0f);
+                if (std::memcmp(got.data() + at, &want_layer, 4)) {
+                    FLOAT layer_value;
+                    std::memcpy(&layer_value, got.data() + at, 4);
+                    std::fprintf(stderr, "%s (%u,%u): layer cleared %g, expected %g\n", what, x, y, layer_value,
+                                 want_layer);
+                    ++wrong;
+                }
+            }
+        if (wrong) return false;
+        std::printf("%s: %ux%u depth texels matched (%s)\n", what, width, height,
+                    unrestricted_depth ? "WARP parity" : "restricted Vulkan depth");
+        return true;
+    };
+    if (!compare("depth clear with 1.5 and -0.5", 1.5f, -0.5f, false, 1.5f, -0.5f)) return false;
+    // NaN is likewise not clamped away; WARP stores the quiet NaN it was given.
+    const FLOAT nan = std::numeric_limits<float>::quiet_NaN();
+    if (!compare("depth clear with NaN", nan, nan, false, nan, nan)) return false;
+    return compare("flags 0 leaves the target alone", 0.25f, 0.75f, true, 0.25f, 0.25f);
+}
+
 int main(int argc, char** argv) {
     const bool volume_only = argc == 2 && std::strcmp(argv[1], "--volume") == 0;
     const bool rgb9e5_only = argc == 2 && std::strcmp(argv[1], "--rgb9e5") == 0;
-    if (argc != 1 && !volume_only && !rgb9e5_only) {
-        std::fprintf(stderr, "usage: d3d12_clear_test [--volume|--rgb9e5]\n");
+    const bool restricted_depth = argc == 2 && std::strcmp(argv[1], "--restricted-depth") == 0;
+    if (argc != 1 && !volume_only && !rgb9e5_only && !restricted_depth) {
+        std::fprintf(stderr, "usage: d3d12_clear_test [--volume|--rgb9e5|--restricted-depth]\n");
         return 2;
     }
     vktest::Device vk;
+    vk.request_depth_range_unrestricted = !restricted_depth && !volume_only && !rgb9e5_only;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -395,6 +451,7 @@ int main(int argc, char** argv) {
         info.device = vk.device;
         info.queue = vk.queue;
         info.queue_family = vk.family;
+        info.depth_range_unrestricted = vk.depth_range_unrestricted;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         if (rgb9e5_only) {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
@@ -421,9 +478,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "WARP reference unavailable: differential test cannot run\n");
             return 1;
         }
+        if (restricted_depth)
+            return check_depth_clear_edge_values(host.p, ours.p, false) ? 0 : 1;
         if (!check_volume_rtvs(host.p, ours.p)) return 1;
         if (volume_only) return 0;
         if (!check_unlisted_rtvs(ours.p)) return 1;
+        if (!check_depth_clear_edge_values(host.p, ours.p, vk.depth_range_unrestricted)) return 1;
         const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
         // Integer-format values: negatives, fractions, NaN and overflow exercise the numeric float->int conversion.
         const std::array<float, 4> int_values[] = {
@@ -627,7 +687,7 @@ int main(int argc, char** argv) {
             static_cast<unsigned long long>(validation_errors));
     if (validation_errors) return 1;
     if (compare_failed) return compare_failed;
-    if (volume_only || rgb9e5_only) return 0;
+    if (volume_only || rgb9e5_only || restricted_depth) return 0;
     std::printf("RTV and DSV clears: %u full/rectangle readbacks matched WARP\n", cases_checked);
     return 0;
 }

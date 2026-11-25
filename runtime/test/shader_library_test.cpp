@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -115,6 +116,285 @@ std::vector<std::uint8_t> container(std::initializer_list<Payload> payloads) {
     put32(out, std::uint32_t(dxil.size()));
     out.insert(out.end(), dxil.begin(), dxil.end());
     return out;
+}
+
+// Exercises the canonical Huffman fast lookup table (1..9 bits), the slow fallback (10..15 bits),
+// incomplete/empty/over-subscribed tables, and 64-bit BitReader prefetching across align()/position()/EOF.
+int huffman_lut_checks() {
+    using namespace leonida;
+
+    struct BitWriter {
+        std::vector<std::uint8_t> bytes;
+        unsigned bit_pos = 0;
+
+        void write_lsb(std::uint32_t v, int n) {
+            for (int i = 0; i < n; ++i) {
+                if (bit_pos == 0) bytes.push_back(0);
+                bytes.back() |= std::uint8_t(((v >> i) & 1u) << bit_pos);
+                bit_pos = (bit_pos + 1) & 7u;
+            }
+        }
+        void write_msb(std::uint32_t code, int len) {
+            for (int i = len - 1; i >= 0; --i) write_lsb((code >> i) & 1u, 1);
+        }
+        void align() { bit_pos = 0; }
+        void write_byte(std::uint8_t b) {
+            align();
+            bytes.push_back(b);
+        }
+        void write_be32(std::uint32_t v) {
+            for (int s = 24; s >= 0; s -= 8) write_byte(std::uint8_t(v >> s));
+        }
+    };
+
+    const auto adler32 = [](const std::vector<std::uint8_t>& data) -> std::uint32_t {
+        std::uint32_t a = 1, b = 0;
+        for (const std::uint8_t x : data) {
+            a = (a + x) % 65521u;
+            b = (b + a) % 65521u;
+        }
+        return (b << 16) | a;
+    };
+
+    // 1. BitReader::fill() / bits() / position() / align() / byte() across all bit alignments and short tails.
+    {
+        std::vector<std::uint8_t> buf(24);
+        for (std::size_t i = 0; i < buf.size(); ++i) buf[i] = std::uint8_t(0x31u + i * 7u);
+        for (int total_bits = 1; total_bits <= 64; ++total_bits) {
+            detail::BitReader br(buf);
+            CHECK(br.bits(0) == 0 && !br.failed() && br.position() == 0);
+            int read = 0;
+            while (read < total_bits) {
+                const int step = std::min(total_bits - read, (read % 5) + 1);
+                const std::uint32_t got = br.bits(step);
+                std::uint32_t expect = 0;
+                for (int b = 0; b < step; ++b) {
+                    const int bit_index = read + b;
+                    expect |= std::uint32_t((buf[std::size_t(bit_index / 8)] >> (bit_index & 7)) & 1u) << b;
+                }
+                CHECK(!br.failed() && got == expect);
+                read += step;
+            }
+            const std::size_t expected_pos = std::size_t((total_bits + 7) / 8);
+            CHECK(br.position() == expected_pos);
+            br.align();
+            CHECK(br.position() == expected_pos);
+            std::uint8_t next = 0;
+            CHECK(br.byte(next) && next == buf[expected_pos]);
+        }
+        // Short buffer (< 8 bytes) uses the byte-by-byte tail path of fill().
+        const std::vector<std::uint8_t> tiny = {0x5au, 0xc3u, 0x0fu, 0xf0u, 0x12u};
+        detail::BitReader br(tiny);
+        CHECK(br.bits(13) == (0x5au | ((0xc3u & 0x1fu) << 8)));
+        CHECK(br.position() == 2);
+        CHECK(br.bits(27) == ((0xc3u >> 5) | (0x0fu << 3) | (0xf0u << 11) | (0x12u << 19)));
+        CHECK(!br.failed() && br.position() == 5);
+        CHECK(br.bits(1) == 0 && br.failed());
+    }
+
+    // 2. Canonical Huffman table spanning every code length 1..15 (Kraft sum = 1).
+    {
+        std::int16_t lengths[16];
+        for (int i = 0; i < 14; ++i) lengths[i] = std::int16_t(i + 1);
+        lengths[14] = 15;
+        lengths[15] = 15;
+        detail::Huffman h;
+        CHECK(detail::build_huffman(h, lengths, 16));
+        CHECK(h.fast_bits == detail::Huffman::kFastBits);
+        CHECK(h.fast_mask == (std::uint32_t(1) << detail::Huffman::kFastBits) - 1u);
+
+        const auto canonical_code = [](int sym) -> std::pair<std::uint32_t, int> {
+            if (sym < 14) return {(std::uint32_t(1) << (sym + 1)) - 2u, sym + 1};
+            return {sym == 14 ? 0x7ffeu : 0x7fffu, 15};
+        };
+
+        // Decode every symbol 0..15 at every starting bit offset 0..7 with prefetch headroom.
+        for (int pad = 0; pad < 8; ++pad) {
+            BitWriter w;
+            w.write_lsb(0xaa55u, pad);
+            for (int sym = 0; sym < 16; ++sym) {
+                const auto [code, len] = canonical_code(sym);
+                w.write_msb(code, len);
+            }
+            for (int z = 0; z < 8; ++z) w.write_byte(0);
+            detail::BitReader br(w.bytes);
+            CHECK(br.bits(pad) == (0xaa55u & ((1u << pad) - 1u)));
+            for (int sym = 0; sym < 16; ++sym) CHECK(detail::decode(br, h) == sym && !br.failed());
+        }
+
+        // Exact-length EOF boundary (0 trailing bytes) and truncation checks for lengths 1..15.
+        for (int sym = 0; sym < 16; ++sym) {
+            const auto [code, len] = canonical_code(sym);
+            BitWriter w;
+            w.write_msb(code, len);
+            detail::BitReader br(w.bytes);
+            CHECK(detail::decode(br, h) == sym && !br.failed());
+            CHECK(br.position() == w.bytes.size());
+            // Truncating the final byte of a >=9-bit code must fail instead of reading past EOF.
+            if (len >= 9) {
+                std::vector<std::uint8_t> short_buf(w.bytes.begin(), w.bytes.end() - 1);
+                detail::BitReader sbr(short_buf);
+                CHECK(detail::decode(sbr, h) == -1 && sbr.failed());
+            }
+        }
+
+        // Empty, single-symbol incomplete, small max_len, and over-subscribed tables (including reuse of `h`).
+        const std::int16_t empty_lens[4] = {0, 0, 0, 0};
+        CHECK(detail::build_huffman(h, empty_lens, 4) && h.fast_bits == 0 && h.fast_mask == 0);
+        {
+            const std::vector<std::uint8_t> two = {0x00u, 0x00u};
+            detail::BitReader br(two);
+            CHECK(detail::decode(br, h) == -1);
+        }
+        const std::int16_t one_len[1] = {1};
+        CHECK(detail::build_huffman(h, one_len, 1) && h.fast_bits == 1 && h.fast_mask == 1);
+        {
+            const std::vector<std::uint8_t> ok_bit = {0x00u}, bad_bit = {0x01u};
+            detail::BitReader br0(ok_bit), br1(bad_bit);
+            CHECK(detail::decode(br0, h) == 0 && !br0.failed());
+            CHECK(detail::decode(br1, h) == -1);
+        }
+        std::int16_t dist_lens[30];
+        for (int i = 0; i < 30; ++i) dist_lens[i] = 5;
+        CHECK(detail::build_huffman(h, dist_lens, 30) && h.fast_bits == 5 && h.fast_mask == 31u);
+        for (int sym = 0; sym < 30; ++sym) {
+            BitWriter w;
+            w.write_msb(std::uint32_t(sym), 5);
+            detail::BitReader br(w.bytes);
+            CHECK(detail::decode(br, h) == sym && !br.failed());
+        }
+        {
+            BitWriter w;
+            w.write_msb(31u, 5);  // unassigned 5-bit distance code
+            detail::BitReader br(w.bytes);
+            CHECK(detail::decode(br, h) == -1);
+        }
+        const std::int16_t over_lens[3] = {1, 1, 1};
+        CHECK(!detail::build_huffman(h, over_lens, 3) && h.fast_bits == 0 && h.fast_mask == 0 && h.fast[0] == 0);
+    }
+
+    // 3. Multi-block fixed -> stored -> fixed zlib streams hitting all 8 bit alignments before align() and Adler-32.
+    {
+        const auto write_fixed_lit = [](BitWriter& w, unsigned sym) {
+            if (sym <= 143)
+                w.write_msb(0x30u + sym, 8);
+            else if (sym <= 255)
+                w.write_msb(0x190u + (sym - 144u), 9);
+            else
+                w.write_msb(sym - 256u, 7);
+        };
+        const std::string mid = "stored-after-align!";
+        const std::string tail = "tail-block";
+        for (unsigned k = 0; k < 8; ++k) {
+            BitWriter w;
+            w.write_byte(0x78);
+            w.write_byte(0x01);
+            std::vector<std::uint8_t> expected;
+            // Block 1 (non-final, fixed): k copies of 9-bit literal 0x90 shift EOB across all 8 mod-8 bit offsets.
+            w.write_lsb(0, 1);  // BFINAL = 0
+            w.write_lsb(1, 2);  // BTYPE = fixed
+            for (unsigned i = 0; i < k; ++i) {
+                write_fixed_lit(w, 0x90u + i);
+                expected.push_back(std::uint8_t(0x90u + i));
+            }
+            write_fixed_lit(w, 256);  // EOB
+            // Block 2 (non-final, stored): tests BitReader::align() rewinding prefetched bytes.
+            w.write_lsb(0, 1);  // BFINAL = 0
+            w.write_lsb(0, 2);  // BTYPE = stored
+            w.align();
+            const std::uint16_t n = std::uint16_t(mid.size());
+            const std::uint16_t nlen = std::uint16_t(~n);
+            w.write_byte(std::uint8_t(n));
+            w.write_byte(std::uint8_t(n >> 8));
+            w.write_byte(std::uint8_t(nlen));
+            w.write_byte(std::uint8_t(nlen >> 8));
+            for (char c : mid) {
+                w.write_byte(std::uint8_t(c));
+                expected.push_back(std::uint8_t(c));
+            }
+            // Block 3 (final, fixed): ends right before Adler-32.
+            w.write_lsb(1, 1);  // BFINAL = 1
+            w.write_lsb(1, 2);  // BTYPE = fixed
+            for (char c : tail) {
+                write_fixed_lit(w, std::uint8_t(c));
+                expected.push_back(std::uint8_t(c));
+            }
+            write_fixed_lit(w, 256);
+            w.write_be32(adler32(expected));
+
+            std::vector<std::uint8_t> out;
+            CHECK(zlib_inflate(w.bytes, out, expected.size()) && out == expected);
+            for (std::size_t cut = 0; cut < w.bytes.size(); ++cut) {
+                std::vector<std::uint8_t> trunc(w.bytes.begin(), w.bytes.begin() + cut);
+                CHECK(!zlib_inflate(trunc, out, expected.size()));
+            }
+        }
+    }
+
+    // 4. Full zlib_inflate dynamic block with literal/EOB codes spanning lengths 1..15 (fast LUT + slow fallback).
+    {
+        // Symbols 'a'..'n' (14 syms): lengths 1..14; 'o': length 15; EOB (256): length 15. Kraft sum = 1.
+        BitWriter w;
+        w.write_byte(0x78);
+        w.write_byte(0x01);
+        w.write_lsb(1, 1);   // BFINAL = 1
+        w.write_lsb(2, 2);   // BTYPE = dynamic
+        w.write_lsb(0, 5);   // HLIT = 257 (symbols 0..256)
+        w.write_lsb(0, 5);   // HDIST = 1 (distance 0, length 0)
+        w.write_lsb(15, 4);  // HCLEN = 19 code-length symbols
+        // Complete code-length tree (Kraft sum = 15/16 + 2/32 = 1, accepted by standard zlib):
+        // symbols 0..14 have length 4 (codes 0..14); symbols 15 and 18 have length 5 (codes 30 and 31).
+        // Order: 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15.
+        static constexpr int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+        std::int16_t cl_lens[19] = {};
+        for (int s = 0; s <= 14; ++s) cl_lens[s] = 4;
+        cl_lens[15] = 5;
+        cl_lens[18] = 5;
+        for (int i = 0; i < 19; ++i) w.write_lsb(std::uint32_t(cl_lens[order[i]]), 3);
+        const auto emit_zeros = [&](int count) {
+            while (count >= 11) {
+                const int run = std::min(count, 138);
+                w.write_msb(31u, 5);  // symbol 18
+                w.write_lsb(std::uint32_t(run - 11), 7);
+                count -= run;
+            }
+            while (count-- > 0) w.write_msb(0u, 4);
+        };
+        // Lengths for literals 0..96 ('a' is 97): 97 zeros.
+        emit_zeros(97);
+        // 'a'..'n' (97..110): lengths 1..14; 'o' (111): length 15.
+        for (int len = 1; len <= 14; ++len) w.write_msb(std::uint32_t(len), 4);
+        w.write_msb(30u, 5);  // 'o' (length 15)
+        // 112..255: 144 zeros.
+        emit_zeros(144);
+        // 256 (EOB): length 15; distance 0: length 0.
+        w.write_msb(30u, 5);
+        w.write_msb(0u, 4);
+
+        std::vector<std::uint8_t> expected;
+        for (int rep = 0; rep < 4; ++rep) {
+            for (int i = 0; i < 15; ++i) {
+                const int len = i < 14 ? (i + 1) : 15;
+                const std::uint32_t code = i < 14 ? ((std::uint32_t(1) << len) - 2u) : 0x7ffeu;
+                w.write_msb(code, len);
+                expected.push_back(std::uint8_t('a' + i));
+            }
+        }
+        w.write_msb(0x7fffu, 15);  // EOB (symbol 256)
+        w.write_be32(adler32(expected));
+
+        std::vector<std::uint8_t> out;
+        CHECK(zlib_inflate(w.bytes, out, expected.size()) && out == expected);
+        auto bad_adler = w.bytes;
+        bad_adler.back() ^= 1u;
+        CHECK(!zlib_inflate(bad_adler, out, expected.size()));
+        for (std::size_t cut = 0; cut < w.bytes.size(); ++cut) {
+            std::vector<std::uint8_t> trunc(w.bytes.begin(), w.bytes.begin() + cut);
+            CHECK(!zlib_inflate(trunc, out, expected.size()));
+        }
+    }
+
+    return 0;
 }
 
 // A synthetic kind-6 program (docs/fspx.md): the 36-byte prologue (three VOP3 words with opcode 0x180 and their
@@ -282,6 +562,22 @@ int main() {
     CHECK(zlib_inflate(stored, out) && out.size() == 40);
     for (std::uint8_t i = 0; i < 40; ++i) CHECK(out[i] == i);
     CHECK(zlib_inflate(fixed, out) && out == bytes("hello hello hello leonida"));
+    {
+        // Python zlib.compress(b'\xff' * 5553 + b'abc' * 5553). Exercises overlapping
+        // matches with periods one and three across multiple Adler reduction boundaries.
+        const std::vector<std::uint8_t> repeated = {
+            0x78, 0x9c, 0xed, 0xc2, 0x41, 0x11, 0x00, 0x00, 0x08, 0x03, 0xa0, 0xac,
+            0xd3, 0xfe, 0x19, 0x66, 0x0d, 0x1f, 0x70, 0xb4, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xbc, 0x90, 0x59, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xd5, 0x3c, 0x7b, 0xa2, 0x71,
+            0x87, 0x48,
+        };
+        std::vector<std::uint8_t> expected(5553, 0xff);
+        for (int i = 0; i < 5553; ++i) expected.insert(expected.end(), {'a', 'b', 'c'});
+        CHECK(zlib_inflate(repeated, out, expected.size()) && out == expected);
+        ZlibError why{};
+        CHECK(!zlib_inflate(repeated, out, expected.size() - 1, &why) && why == ZlibError::limit);
+    }
     CHECK(zlib_inflate(dynamic, out) && out == skewed(600));
     CHECK(sha256_hex(out) == "9cd6848f765bff2a9f42a8b42f6164042dad67d3e9f82e0044ddc7d1ecdeebb2");
     auto broken = dynamic;
@@ -291,7 +587,21 @@ int main() {
     broken.resize(100);  // truncated
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
+    const auto max_limit = (std::numeric_limits<std::size_t>::max)();
+    CHECK(zlib_inflate(stored, out, max_limit) && out.size() == 40);
+    CHECK(zlib_inflate(fixed, out, max_limit) && out == bytes("hello hello hello leonida"));
+    CHECK(zlib_inflate(dynamic, out, max_limit) && out == skewed(600));
     CHECK(!zlib_inflate(bytes("not zlib"), out));
+    // The reason a caller can ask for (dstorage.cpp reports each with its own HRESULT).
+    ZlibError why = ZlibError::limit;
+    CHECK(zlib_inflate(dynamic, out, 600, &why) && why == ZlibError::none);
+    CHECK(!zlib_inflate(dynamic, out, 599, &why) && why == ZlibError::limit);
+    CHECK(!zlib_inflate(bytes("not zlib"), out, 1 << 20, &why) && why == ZlibError::header);
+    broken = dynamic;
+    broken.back() ^= 1;
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::checksum);
+    broken.resize(100);
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
 
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.
@@ -363,7 +673,9 @@ int main() {
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
-                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
+                 "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"-1\": [1, 2], "
+                 "\"+2\": [3, 4], \" 3\": [5, 6], \"4294967296\": [9, 10], \"99999999999999999999\": [11, 12], "
+                 "\"7\": [20, 21]}},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
@@ -408,6 +720,22 @@ int main() {
           emulated->emulated());
     CHECK(emulated->lds_bytes == 33332 && entry->lds_bytes == 0);  // workgroup bytes, emulation included (SHADER-309)
     CHECK(library.spirv(*entry).size() == 5);
+    // A relative folder (LEONIDA_SHADERS=spirv) is fixed when it is loaded: the modules are read later, after the title
+    // may have changed the current directory, and must still come from the folder that was loaded.
+    {
+        const auto cwd = std::filesystem::current_path();
+        std::filesystem::current_path(dir.parent_path());
+        ShaderLibrary relative;
+        const bool loaded = relative.load(dir.filename(), &error);
+        std::filesystem::current_path(dir);  // <dir>/<dir's name> does not exist
+        const ShaderEntry* found = loaded ? relative.find("cs", entry->fssm_sha256) : nullptr;
+        const bool read = found && relative.spirv(*found).size() == 5;
+        std::filesystem::current_path(cwd);
+        std::error_code ec;
+        CHECK(loaded && relative.directory().is_absolute() &&
+              std::filesystem::equivalent(relative.directory(), dir, ec));
+        CHECK(read);
+    }
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
     {
         std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
@@ -416,6 +744,81 @@ int main() {
     error.clear();
     CHECK(!library.load(dir.string(), &error) && !error.empty());  // refused, not thrown
     std::filesystem::remove_all(dir);
+
+    // The descriptor-hash marker (`descriptor_hash` in each module's meta, descriptor_table.h): absent is bare fnv1a;
+    // the census covers the root index and every sub-index, and the majority decides. LEONIDA_DESCRIPTOR_HASH overrides
+    // in the device, through descriptor_hash_kind_from_env.
+    {
+        const auto root = dir / "hash_kinds";
+        const auto write_index = [](const std::filesystem::path& folder, const std::string& modules) {
+            std::filesystem::create_directories(folder);
+            std::ofstream index(folder / "index.json", std::ios::binary);
+            index << "{" << modules << "}";
+        };
+        const auto module = [](const char* name, const char* marker) {
+            std::string out = "{\"stage\": \"vs\", \"fssm_sha256\": \"" + std::string(name) + "\"";
+            if (marker) out += ", \"descriptor_hash\": \"" + std::string(marker) + "\"";
+            return out + "}";
+        };
+        const auto census = [](const ShaderLibrary& library, std::size_t fmix32, std::size_t fnv1a) {
+            return library.descriptor_hash_census().fnv1a_fmix32 == fmix32 &&
+                   library.descriptor_hash_census().fnv1a == fnv1a;
+        };
+
+        // All-new and all-old: every module agrees, so that is the kind.
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", "fnv1a_fmix32"));
+        ShaderLibrary all_new;
+        CHECK(all_new.load(root.string(), &error));
+        CHECK(census(all_new, 2, 0) && all_new.descriptor_hash_kind() == DescriptorHashKind::fnv1a_fmix32);
+
+        write_index(root, "\"a\": " + module("aa", nullptr) + ", \"b\": " + module("bb", nullptr));
+        ShaderLibrary all_old;
+        CHECK(all_old.load(root.string(), &error));
+        CHECK(census(all_old, 0, 2) && all_old.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+
+        // Mixed: the majority wins (an explicit "fnv1a" counts as fnv1a, like an absent marker).
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", "fnv1a_fmix32") +
+                              ", \"c\": " + module("cc", nullptr));
+        ShaderLibrary mixed_majority;
+        CHECK(mixed_majority.load(root.string(), &error));
+        CHECK(census(mixed_majority, 2, 1) &&
+              mixed_majority.descriptor_hash_kind() == DescriptorHashKind::fnv1a_fmix32);
+
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", "fnv1a") +
+                              ", \"c\": " + module("cc", nullptr) + ", \"d\": " + module("dd", nullptr));
+        ShaderLibrary mixed_minority;
+        CHECK(mixed_minority.load(root.string(), &error));
+        CHECK(census(mixed_minority, 1, 3) && mixed_minority.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+
+        // A tie has no majority: the old bare FNV-1a stays.
+        write_index(root, "\"a\": " + module("aa", "fnv1a_fmix32") + ", \"b\": " + module("bb", nullptr));
+        ShaderLibrary tied;
+        CHECK(tied.load(root.string(), &error));
+        CHECK(census(tied, 1, 1) && tied.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+
+        // A sub-index's marker is counted too: two old modules in the root and one new one in fspx/ is a 1 fnv1a_fmix32
+        // / 2 fnv1a library, and loading a folder replaces the census rather than adding to it.
+        write_index(root, "\"a\": " + module("aa", nullptr) + ", \"b\": " + module("bb", nullptr));
+        write_index(root / "fspx", "\"upscaler\": " + module("cc", "fnv1a_fmix32"));
+        ShaderLibrary sub_index;
+        CHECK(sub_index.load(root.string(), &error));
+        CHECK(census(sub_index, 1, 2) && sub_index.descriptor_hash_kind() == DescriptorHashKind::fnv1a);
+        CHECK(sub_index.load(root.string(), &error) && census(sub_index, 1, 2));  // reload, not accumulate
+        std::filesystem::remove_all(root / "fspx");
+        CHECK(sub_index.load(root.string(), &error) && census(sub_index, 0, 2));
+
+        // LEONIDA_DESCRIPTOR_HASH: an exact kind name wins over the census; anything else is ignored.
+        DescriptorHashKind chosen = DescriptorHashKind::fnv1a_fmix32;
+        CHECK(descriptor_hash_kind_from_env("fnv1a", &chosen) && chosen == DescriptorHashKind::fnv1a);
+        CHECK(descriptor_hash_kind_from_env("fnv1a_fmix32", &chosen) &&
+              chosen == DescriptorHashKind::fnv1a_fmix32);
+        CHECK(!descriptor_hash_kind_from_env(nullptr, &chosen));
+        CHECK(!descriptor_hash_kind_from_env("", &chosen));
+        CHECK(!descriptor_hash_kind_from_env("Fnv1a", &chosen));
+        CHECK(!descriptor_hash_kind_from_env("other", &chosen));
+        CHECK(chosen == DescriptorHashKind::fnv1a_fmix32);  // a refused value leaves the caller's kind alone
+        std::filesystem::remove_all(dir);
+    }
 
     if (const int line = fspx_checks()) return line;
 
@@ -442,6 +845,7 @@ int main() {
         const auto found = fspx.fspx_candidates("cs", code_hash);
         CHECK(found.size() == 1 && found[0]->name == "fspx/upscaler_00" && found[0]->local_size[0] == 8 &&
               found[0]->wave64 && found[0]->fssm_sha256.empty());
+        CHECK(found[0]->code_base_known && !found[0]->uses_code_base);
         CHECK(fspx.spirv(*found[0]).size() == 5);  // <dir>/fspx/upscaler_00.spv
         // The key computed both ways finds the entry: from the container slot 62 gets, from the bare program.
         CHECK(fspx.program_candidates("cs", compute_program(accc_container(fspx_payload(code)))) == found);
@@ -462,6 +866,79 @@ int main() {
               fspx.fspx_candidates("cs", code_hash).empty());
         std::filesystem::remove(dir / "fspx" / "index.json");
         CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_size() == 0 && fspx.find("cs", hash));
+        std::filesystem::rename(dir / "fspx", dir / "fspx_compute");
+        {
+            std::ofstream sub(dir / "fspx_compute" / "index.json", std::ios::binary);
+            sub << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << code_hash
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(std::vector<std::uint8_t>(28, 0x11)) << "\"}}";
+        }
+        CHECK(fspx.load(dir.string(), &error) && fspx.size() == 3 && fspx.fspx_size() == 0 &&
+              fspx.fspx_compute_size() == 1);
+        const auto compute = fspx.program_candidates("cs", compute_program(fspx_payload(code)));
+        CHECK(compute.size() == 1 && compute[0]->name == "fspx_compute/upscaler_00" &&
+              fspx.spirv(*compute[0]).size() == 5);
+        std::filesystem::remove_all(dir);
+    }
+
+    // Pipeline-library entries: the compute programs of the library in shaders.rpf, translated by make_game.py into
+    // <dir>/library/index.json (named "library/<name>"), are found by the same two keys as the DLL's FSPX programs,
+    // next to <dir>/fspx/. The executable's slot-67 description carries kind 0 (the record's state blob) and kind 6.
+    {
+        const auto code = fspx_code(0x5000);
+        const auto shared_code = fspx_code(0x7000);
+        std::vector<std::uint8_t> state(28, 0), other_state(28, 0);
+        state[12] = 64;  // word 3: NumThreadsX
+        other_state[12] = 32;
+        const auto n = std::uint32_t(code.size());
+        const auto payload = [&](const std::vector<std::uint8_t>& kind0) {
+            std::vector<std::uint8_t> body = kind0;
+            body.insert(body.end(), code.begin(), code.end());
+            return fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body);
+        };
+        std::filesystem::create_directories(dir / "fspx");
+        std::filesystem::create_directories(dir / "library");
+        {
+            std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
+            index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"}}";
+            std::ofstream dll(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            dll << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(fspx_code(0x6000))
+                << "\"}, \"shared_dll\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(shared_code)
+                << "\"}}";
+            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
+            lib << "{\"lib_cs_00007\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(code)
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(state)
+                << "\", \"bindings\": [], \"local_size\": [64, 1, 1]}, "
+                << "\"lib_cs_shared\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(shared_code)
+                << "\"}}";
+            std::ofstream spv(dir / "library" / "lib_cs_00007.spv", std::ios::binary);
+            const std::uint32_t words[5] = {0x07230203, 0x00010500, 7, 1, 0};
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary library;
+        CHECK(library.load(dir.string(), &error) && library.size() == 5 && library.fspx_size() == 4);
+        const auto found = library.fspx_candidates("cs", sha256_hex(code));
+        CHECK(found.size() == 1 && found[0]->name == "library/lib_cs_00007" && found[0]->local_size[0] == 64 &&
+              found[0]->fssm_sha256.empty());
+        CHECK(library.spirv(*found[0]).size() == 5);  // <dir>/library/lib_cs_00007.spv
+        // fspx/ loads before library/, so shared code keys preserve fspx/ entries ahead of library/ entries.
+        const auto shared = library.fspx_candidates("cs", sha256_hex(shared_code));
+        CHECK(shared.size() == 2 && shared[0]->name == "fspx/shared_dll" && shared[1]->name == "library/lib_cs_shared");
+        // As slot 67 passes it: kind 0 and kind 6 in one payload. The record's state finds it; another state doesn't.
+        bool ambiguous = true;
+        CHECK(library.program_candidates("cs", compute_program(payload(state)), &ambiguous) == found && !ambiguous);
+        CHECK(library.program_candidates("cs", compute_program(payload(other_state)), &ambiguous).empty());
+        // The DLL's entries are still there, and the game's own by FSSM hash.
+        CHECK(library.fspx_candidates("cs", sha256_hex(fspx_code(0x6000))).at(0)->name == "fspx/upscaler_00");
+        CHECK(library.find("cs", hash) && library.find("cs", hash)->name == "cs_game");
+        // A broken library index leaves the others loaded; a missing one is not an error either.
+        {
+            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
+            lib << "{broken";
+        }
+        CHECK(library.load(dir.string(), &error) && library.size() == 3 && library.fspx_size() == 2 &&
+              library.fspx_candidates("cs", sha256_hex(code)).empty());
+        std::filesystem::remove(dir / "library" / "index.json");
+        CHECK(library.load(dir.string(), &error) && library.size() == 3 && library.fspx_size() == 2);
         std::filesystem::remove_all(dir);
     }
 
@@ -486,7 +963,7 @@ int main() {
         std::filesystem::create_directories(dir / "fspx");
         write(dir / "index.json", "{" + game + "}");
         write(dir / "fspx" / "index.json",
-              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"uses_code_base\": false, \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
         // The second entry is a program whose metadata failed: no key, so nothing can find it and it is not counted.
         write(dir / "bvh" / "index.json",
               "{\"BuilderProgram\": " + program_entry + ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
@@ -501,11 +978,14 @@ int main() {
         const auto found = bvh.program_candidates("cs", program);
         CHECK(found.size() == 1 && found[0]->name == "bvh/BuilderProgram" && found[0] == bvh.find("cs", builder_hash));
         CHECK(found[0]->lds_bytes == 32768 && found[0]->wave64 && found[0]->subgroup_size == 64 &&
-              found[0]->uses_code_base && found[0]->local_size[0] == 64 && found[0]->fspx_code_sha256.empty());
+              found[0]->code_base_known && found[0]->uses_code_base && found[0]->local_size[0] == 64 && found[0]->fspx_code_sha256.empty());
         CHECK(bvh.spirv(*found[0]).size() == 5);  // <dir>/bvh/BuilderProgram.spv
         // The other indexes are untouched: the game's shader and the FSPX program are found as before, each by its
         // own key, and a builder program is neither an FSPX program nor a shader of another stage.
         CHECK(bvh.find("cs", hash) && bvh.find("cs", hash)->name == "cs_game");
+        CHECK(!bvh.find("cs", hash)->code_base_known);
+        const auto* no_code_base = bvh.program_candidates("cs", compute_program(code)).at(0);
+        CHECK(no_code_base->code_base_known && !no_code_base->uses_code_base);
         CHECK(bvh.program_candidates("cs", compute_program(code)).at(0)->name == "fspx/upscaler_00");
         CHECK(bvh.fspx_candidates("cs", builder_hash).empty() && bvh.candidates("vs", builder_hash).empty());
         // A program the translator left out (Box16Rehydration today) has no entry: nothing is found, and no other
@@ -532,6 +1012,98 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // game_scarlett_master.exe's inline containers (docs/embedded_shaders.md, "Retail executable"): translated into
+    // <dir>/exe (entries named "exe/<name>") and found by fssm_sha256, like the game's and the builder's shaders.
+    {
+        const std::string exe_hash = sha256_hex(bytes("scarlett master executable shader"));
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        std::filesystem::create_directories(dir / "exe");
+        {
+            std::ofstream index(dir / "exe" / "index.json", std::ios::binary);
+            index << "{\"container_00\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << exe_hash
+                  << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"wave64\": true, \"subgroup_size\": 64, "
+                     "\"input_signature\": [{\"semantic\": \"SV_VertexID\", \"semantic_index\": 0, \"register\": 0, "
+                     "\"system_value\": 6, \"component_type\": \"uint\"}]}}";
+            std::ofstream spv(dir / "exe" / "container_00.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        {
+            std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
+            index << "{\"vs_game\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\"}}";
+        }
+        ShaderLibrary exe;
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 2 && exe.exe_size() == 1);
+        const auto found = exe.candidates("vs", exe_hash);
+        CHECK(found.size() == 1 && found[0]->name == "exe/container_00" && found[0]->wave64 &&
+              found[0]->push_constant_bytes == 144 && found[0]->input_signature.size() == 1 &&
+              found[0]->input_signature[0].semantic == "SV_VertexID");
+        CHECK(exe.spirv(*found[0]).size() == 5);  // <dir>/exe/container_00.spv
+        CHECK(exe.candidates("vs", hash).at(0)->name == "vs_game");
+        CHECK(exe.candidates("ps", exe_hash).empty());
+        std::filesystem::remove_all(dir / "exe");
+        std::filesystem::remove_all(dir);
+    }
+
+    // Executable embedded shaders (<dir>/exe/index.json): graphics (vs/ps) FSSM programs indexed alongside the game's
+    // own shaders, counted apart via exe_size(), and optional when missing or malformed.
+    {
+        const auto vs_container = container({{fixed, 25}});
+        const auto ps_container = container({{stored, 40}});
+        const std::string vs_hash = sha256_hex(fssm_program(vs_container));
+        const std::string ps_hash = sha256_hex(fssm_program(ps_container));
+        const auto code = fspx_code(0x5000);
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
+        };
+        const std::string game = "\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}";
+        const std::string vs_entry = "{\"stage\": \"vs\", \"fssm_sha256\": \"" + vs_hash +
+                                     "\", \"input_signature\": [{\"semantic\": \"POSITION\", \"semantic_index\": 0, "
+                                     "\"register\": 0, \"system_value\": 0, \"component_type\": \"float\"}]}";
+        const std::string ps_entry = "{\"stage\": \"ps\", \"fssm_sha256\": \"" + ps_hash + "\"}";
+        std::filesystem::create_directories(dir / "fspx");
+        std::filesystem::create_directories(dir / "bvh");
+        std::filesystem::create_directories(dir / "exe");
+        write(dir / "index.json", "{" + game + "}");
+        write(dir / "fspx" / "index.json",
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
+        write(dir / "bvh" / "index.json",
+              "{\"BuilderProgram\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}}");
+        write(dir / "exe" / "index.json",
+              "{\"container_00\": " + vs_entry + ",\n \"container_01\": " + ps_entry +
+                  ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
+        {
+            std::ofstream spv(dir / "exe" / "container_00.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+            std::ofstream spv_ps(dir / "exe" / "container_01.spv", std::ios::binary);
+            spv_ps.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary exe;
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 5 && exe.fspx_size() == 1 && exe.bvh_size() == 1 &&
+              exe.exe_size() == 2);
+        const ShaderEntry* vs = exe.find("vs", vs_hash);
+        const ShaderEntry* ps = exe.find("ps", ps_hash);
+        CHECK(vs && vs->name == "exe/container_00" && vs->input_signature.size() == 1 &&
+              vs->input_signature[0].semantic == "POSITION" && exe.spirv(*vs).size() == 5);
+        CHECK(ps && ps->name == "exe/container_01" && exe.spirv(*ps).size() == 5);
+        CHECK(exe.candidates("ps", vs_hash).empty() && exe.candidates("vs", ps_hash).empty() &&
+              exe.fspx_candidates("vs", vs_hash).empty());
+        // Same program in main index and exe/: main comes first (index order).
+        write(dir / "index.json", "{" + game + ",\n \"vs_same\": " + vs_entry + "}");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 6 && exe.exe_size() == 2);
+        const auto both = exe.candidates("vs", vs_hash);
+        CHECK(both.size() == 2 && both[0]->name == "vs_same" && both[1]->name == "exe/container_00");
+        write(dir / "index.json", "{" + game + "}");
+        // Broken or missing exe/index.json leaves main, fspx, and bvh loaded and resets exe_size() to 0.
+        write(dir / "exe" / "index.json", "{broken");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.bvh_size() == 1 &&
+              exe.fspx_size() == 1 && !exe.find("vs", vs_hash));
+        std::filesystem::remove(dir / "exe" / "index.json");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.find("cs", hash));
+        std::filesystem::remove_all(dir);
+    }
+
     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.
@@ -554,14 +1126,16 @@ int main() {
             std::ofstream spv(dir / "fspx" / (name + ".spv"), std::ios::binary);
             spv.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
         };
-        const auto index = [&](const std::vector<std::pair<std::string, const std::vector<std::uint8_t>*>>& entries) {
+        const auto index = [&](const std::vector<std::pair<std::string, const std::vector<std::uint8_t>*>>& entries,
+                               bool different_layout = false) {
             std::ofstream main(dir / "index.json", std::ios::binary | std::ios::trunc);
             main << "{}";
             std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
             sub << "{";
             for (std::size_t i = 0; i < entries.size(); ++i)
                 sub << (i ? ",\n" : "") << "\"" << entries[i].first << "\": {\"stage\": \"cs\", \"fspx_code_sha256\": \""
-                    << sha256_hex(code) << "\", \"fspx_state_sha256\": \"" << sha256_hex(*entries[i].second) << "\"}";
+                    << sha256_hex(code) << "\", \"fspx_state_sha256\": \"" << sha256_hex(*entries[i].second) << "\""
+                    << (i == 1 && different_layout ? ", \"push_constant_bytes\": 16" : "") << "}";
             sub << "}";
         };
         std::filesystem::create_directories(dir / "fspx");
@@ -596,6 +1170,12 @@ int main() {
         // The same two keys with one module (a duplicate container) is not ambiguous for the bare program.
         write("pair_64", module(1));
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).size() == 2 && !ambiguous);
+        // Equal words with conflicting layout metadata are ambiguous until kind 0 selects one entry.
+        index({{"pair_32", &state32}, {"pair_64", &state64}}, true);
+        CHECK(pair.load(dir.string(), &error));
+        CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).empty() && ambiguous);
+        const auto by_layout = pair.program_candidates("cs", compute_program(wrapped(state64)), &ambiguous);
+        CHECK(by_layout.size() == 1 && by_layout[0]->push_constant_bytes == 16 && !ambiguous);
         // One translation for the code key: the bare program takes it.
         index({{"pair_32", &state32}});
         CHECK(pair.load(dir.string(), &error) && pair.size() == 1);
@@ -632,6 +1212,8 @@ int main() {
         CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {5, kind7.data(), 24}}).empty());
         CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
+
+    CHECK(huffman_lut_checks() == 0);
 
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");
     return 0;

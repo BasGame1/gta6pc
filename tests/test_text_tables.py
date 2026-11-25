@@ -161,6 +161,7 @@ class TestTables(unittest.TestCase):
         self.assertEqual(T.language(["Привет"]), "ru")
         self.assertEqual(T.language(["안녕하세요"]), "ko")
         self.assertEqual(T.language(["你好世界"]), "zh")
+        self.assertEqual(T.language(["مرحبا بالعالم"]), "ar")
 
     def test_group(self):
         self.assertEqual(T.table_group(["BIL1_A_1", "BIL1_B_2", "BIL1_C_3", "OTHER"]), "BIL1")
@@ -531,6 +532,45 @@ class TestNestedArchiveLanguage(unittest.TestCase):
             with open(out, encoding="utf-8", newline="") as fh:
                 self.assertEqual([(r["lang"], r["guess"], r["archive"]) for r in csv.DictReader(fh)],
                                  [("xx", "xx", "")])
+
+
+class TestVideoBoundaries(unittest.TestCase):
+    def test_video_separates_blobs_in_archives_and_carve_folders(self):
+        import gamedata_index
+        import zlib
+
+        first, second = bytes(T.BLOCK), b"b" * 64
+        compressed = zlib.compress(first)
+        video = bytearray(64)
+        struct.pack_into("<4sI", video, 0, b"KB2n", len(video) - 8)
+        struct.pack_into("<II", video, 0x14, 16, 16)
+        header = struct.pack("<4sIII", b"9FPR", 16, 0, 0)
+        video_off = len(header) + len(compressed)
+        second_off = video_off + len(video)
+        expected = [(len(header), first), (second_off, second)]
+
+        def forbid_video(read):
+            def guarded(source, row):
+                self.assertNotEqual(row.get("type"), "bink2")
+                return read(source, row)
+            return guarded
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "sample.rpf")
+            write(archive, header + compressed + video + zlib.compress(second))
+            for off, data in expected:
+                write(os.path.join(tmp, f"{off:012x}.bin"), data)
+            files = [{"off": off, "size": len(data)} for off, data in expected]
+            files.insert(1, {"off": video_off, "size": len(video), "type": "bink2"})
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as manifest:
+                json.dump({"files": files}, manifest)
+
+            for src, reader in ((archive, gamedata_index.ArchiveSource), (tmp, gamedata_index.DirectorySource)):
+                with self.subTest(source=reader.__name__), patch.object(reader, "read", forbid_video(reader.read)):
+                    actual = [(off, blob) for _source, off, blob in T.blobs(src)]
+                    self.assertEqual([(off, len(blob)) for off, blob in actual],
+                                     [(off, len(blob)) for off, blob in expected])
+                    self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

@@ -411,6 +411,14 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     memory[p[1]] = v & MASK32
                 else:
                     p[0][p[1]] = v
+            elif op == "OpAtomicStore":   # pointer, scope, semantics, value: a store with no result
+                p = ptrs[a[0]]
+                v = vals[a[3]]
+                if p[0] == "psb":
+                    assert p[1] % 4 == 0, f"unaligned PSB store {p[1]:#x}"
+                    memory[p[1]] = v & MASK32
+                else:
+                    p[0][p[1]] = v
             elif op in ("OpAtomicOr", "OpAtomicIAdd", "OpAtomicAnd", "OpAtomicXor", "OpAtomicExchange"):
                 p = ptrs[a[1]]
                 old = memory.get(p[1], 0) if p[0] == "psb" else p[0][p[1]]
@@ -470,6 +478,12 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
             elif op == "OpShiftRightLogical":
                 bits = types[a[0]][1]
                 vals[res] = (vals[a[1]] & ((1 << bits) - 1)) >> vals[a[2]]
+            elif op == "OpShiftRightArithmetic":
+                bits = types[a[0]][1]
+                operand = vals[a[1]]
+                if operand >> (bits - 1):
+                    operand -= 1 << bits
+                vals[res] = (operand >> vals[a[2]]) & ((1 << bits) - 1)
             elif op == "OpIAdd":
                 bits = types[a[0]][1]
                 vals[res] = (vals[a[1]] + vals[a[2]]) & ((1 << bits) - 1)
@@ -528,6 +542,14 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 elif ext_op == "FindUMsb":
                     v = vals[a[3]] & MASK32
                     vals[res] = v.bit_length() - 1 if v else MASK32
+                elif ext_op == "FindSMsb":
+                    v = _s32(vals[a[3]])
+                    if v in (0, -1):
+                        vals[res] = MASK32
+                    elif v > 0:
+                        vals[res] = v.bit_length() - 1
+                    else:
+                        vals[res] = (~v).bit_length() - 1
                 else:
                     raise NotImplementedError(f"OpExtInst {ext_op}: {line}")
             else:
@@ -991,6 +1013,35 @@ class LocalExecFoldTests(unittest.TestCase):
         mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
         got = [mem.get(i * 4, 0) for i in range(8)]
         self.assertEqual(got, [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])
+
+    def test_mask_pair_with_constant_half_is_not_folded(self):
+        # Old #4480: s[4:5] is a v_cmp mask whose high half was set to 0, s[12:13] a -1 whose high half became a
+        # mask. rdna2spirv reads both as lane masks (s_bcnt1 collects the wave), so the execz region they are
+        # counted in must not be folded as lane-local; it was, and translate() asserted on the x_split inside it.
+        fixture = os.path.join(HERE, "fixtures", "wave64_mask_const_half.asm")
+        with open(fixture, encoding="ascii") as f:
+            lines = f.read().splitlines()
+        prev_emu = rdna2spirv.WAVE64_EMULATE
+        for threads in (64, 128):
+            with self.subTest(threads=threads):
+                rdna2spirv.WAVE64_EMULATE = True
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        os.mkdir(os.path.join(td, "disasm"))
+                        os.mkdir(os.path.join(td, "fssm"))
+                        s_path = os.path.join(td, "disasm", "cs_w64_mask_const_half.s")
+                        with open(s_path, "w", encoding="utf-8") as dst:
+                            dst.write("; cs_w64_mask_const_half  hand-written\n; mattr: +wavefrontsize64,-wavefrontsize32\n")
+                            dst.write("\n".join(ln for ln in lines if not ln.startswith(";")) + "\n")
+                        with open(os.path.join(td, "fssm", "cs_w64_mask_const_half.fssm"), "wb") as f:
+                            f.write(bytes(0x138) + struct.pack("<4I", 0x8088, threads, 1, 1))
+                        spv = rdna2spirv.translate(s_path)
+                finally:
+                    rdna2spirv.WAVE64_EMULATE = prev_emu
+                mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28)
+                for t in range(threads):
+                    want = (8, 40) if t >= 16 else (0, 0)
+                    self.assertEqual((mem.get(8 * t, 0), mem.get(8 * t + 4, 0)), want, f"thread {t}")
 
     def test_write_before_folded_scalar_load_orders_cleanly(self):
         # #1587 interaction: buffer_store before a folded s_cbranch_execz containing s_load_dword must emit
@@ -1596,6 +1647,11 @@ class StructuredEmulationTests(unittest.TestCase):
         lm_45 = {id(bcnt): {4: "mask", 5: "mask"}}
         self.assertTrue(wave64_emulate_opt._holds_lane_mask(bcnt, pair_45, lm_45[id(bcnt)]))
         self.assertFalse(wave64_emulate_opt._holds_lane_mask(bcnt, pair_89, lm_45[id(bcnt)]))
+        # One mask word and one constant word (absent from the map) is still a mask pair (old #4480).
+        self.assertTrue(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(4, 2), {4: "mask_lo"}))
+        self.assertTrue(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(4, 2), {5: "mask_hi"}))
+        self.assertFalse(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(4, 2), {6: "mask_lo"}))
+        self.assertFalse(wave64_emulate_opt._holds_lane_mask(bcnt, sgpr(5), {4: "mask_lo"}))
         self.assertTrue(wave64_emulate_opt._is_mask_op(bcnt, vcc_pair, {}))
         self.assertTrue(wave64_emulate_opt._insn_may_barrier(bcnt, lm_45, set()))
         clean, _, _, _, _ = wave64_emulate_opt._classify_block_body([bcnt], lm_45, set(), frozenset())
@@ -1710,6 +1766,58 @@ class StructuredEmulationTests(unittest.TestCase):
         # s_barrier cleared ("lds", "w"), and folded block 1 added ("mem", "r") after it.
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
+
+
+class SharedWordStoresTests(unittest.TestCase):
+    """The emulation resets %x_buf words every round. Lanes with nothing to reset aim the same store at one sink
+    word, and the prologue clamps its zeroing index, so several invocations write one word at once. A plain OpStore
+    there is a data race (GPU-assisted validation reports it in every emulated shader); OpAtomicStore is not."""
+
+    INSNS = [
+        ("v_cmp_lt_u32_e64 s[6:7], 20, v0", 8),
+        ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+        ("s_cselect_b32 s14, 111, 222", 4),
+        ("s_mov_b64 exec, -1", 4),
+        ("v_mov_b32_e32 v5, s14", 4),
+        ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+        ("buffer_store_dword v5, v6, s[0:3], 0 offen", 8),
+        ("s_endpgm", 4),
+    ]
+
+    @staticmethod
+    def shared_word_stores(spv):
+        """(plain, atomic) stores into %x_buf whose index is not one invocation's own: it comes from an OpSelect
+        (the sink) or from the prologue's UMin clamp."""
+        defined_by, element = {}, {}
+        for line in spv.splitlines():
+            m = re.match(r"\s*(%\w+) = (\w+) (.*)", line)
+            if not m:
+                continue
+            defined_by[m.group(1)] = m.group(2)
+            chain = re.match(r"%_ptr_WG_uint_x %x_buf (%\w+)$", m.group(3)) if m.group(2) == "OpAccessChain" else None
+            if chain:
+                element[m.group(1)] = chain.group(1)
+        plain, atomic = [], []
+        for line in spv.splitlines():
+            m = re.match(r"\s*(OpStore|OpAtomicStore) (%\w+) ", line)
+            if m and defined_by.get(element.get(m.group(2))) in ("OpSelect", "OpExtInst"):
+                (plain if m.group(1) == "OpStore" else atomic).append(line.strip())
+        return plain, atomic
+
+    def test_stores_several_invocations_aim_at_one_word_are_atomic(self):
+        for threads in (64, 128):   # one wave, and two (the per-wave and per-workgroup resets differ)
+            with self.subTest(threads=threads):
+                spv, _ = _translate_encoded(f"cs_shared_words_{threads}", self.INSNS, (threads, 1, 1), emulate=True)
+                plain, atomic = self.shared_word_stores(spv)
+                self.assertEqual(plain, [])
+                self.assertTrue(atomic, "the emulated translation has no shared-word resets to check")
+                # Workgroup scope, relaxed semantics, value 0: the same operands as the OpAtomicOr on this buffer.
+                for line in atomic:
+                    self.assertRegex(line, r"^OpAtomicStore %\w+ %c2 %c0 %c0$")
+
+    def test_native_wave64_translation_is_unchanged(self):
+        spv, _ = _translate_encoded("cs_shared_words_native", self.INSNS, (64, 1, 1), emulate=False)
+        self.assertNotIn("OpAtomicStore", spv)
 
 
 if __name__ == "__main__":

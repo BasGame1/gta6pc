@@ -82,7 +82,7 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
 _MASK_WORD_READERS = frozenset({
     "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
     "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
-    "s_flbit_i32_b32", "s_flbit_i32",
+    "s_flbit_i32_b32", "s_flbit_i32_b64", "s_flbit_i32",
 })
 
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.
@@ -138,6 +138,7 @@ _ALWAYS_BARRIER_OPS = frozenset({
     "s_barrier", "v_readlane_b32", "v_readfirstlane_b32",
     "v_permlane16_b32", "v_permlanex16_b32",
     "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+    "ds_append", "ds_consume",
     "s_wqm_b32", "s_wqm_b64",
 })
 
@@ -679,6 +680,69 @@ def _scalar_liveness(active_blocks, succ):
     return _solve_scalar_liveness(use, kill, preds)
 
 
+def mark_vcc_data_moves(blocks, succ):
+    """Keep both words of scalar VCC copies used as data. Leave predicate copies in lane-mask form.
+
+    Look between full definitions. A predicate read, an uncertain partial write, or a live-out
+    at a block boundary prevents changing the producer. A wide SMEM load already writes both
+    physical words, so an ensuing scalar copy out of that tuple must also read both.
+    """
+    if not any(i["op"] == "s_mov_b64" and _lane_masks.wave32_vcc_pair_op(i["op"], i["args"])
+               for block in blocks for i in block):
+        return
+    vcc = 1 << _BIT_VCC
+    live = _scalar_liveness(blocks, succ)
+    for b, block in enumerate(blocks):
+        numeric_use = 0
+        unsafe = 3 if any(live[n] & vcc for n in succ[b]) else 0
+        for ins in reversed(block):
+            op, args = _lane_masks.base_op(ins["op"]), ins["args"]
+            rd, may_write, kill = _scalar_rw(ins)
+            if not (rd | may_write) & vcc:
+                continue
+            pair = op == "s_mov_b64" and _lane_masks.wave32_vcc_pair_op(op, args)
+            if pair and args[0].get("t") == "vcc" and numeric_use and not unsafe:
+                ins["vcc_data_pair"] = True
+            if kill & vcc:
+                unsafe = numeric_use = 0
+            elif may_write & vcc:
+                half = {"vcc_lo": 1, "vcc_hi": 2}.get(args[0].get("t")) if args else None
+                if half and op in ("s_mov_b32", "s_add_u32"):
+                    unsafe &= ~half
+                    numeric_use &= ~half
+                else:
+                    unsafe |= 3
+            if rd & vcc:
+                # The general liveness pass conservatively counts implicit VCC even with an
+                # explicit e64 predicate in another SGPR pair.
+                if op == "v_cndmask_b32" and len(args) == 4 and args[-1].get("t") != "vcc":
+                    if all(a.get("t") not in ("vcc_lo", "vcc_hi", "vcc") for a in args[1:]):
+                        continue
+                tuple_read = any(a["k"] == "slist" and "vcc_lo" in a["r"] and "vcc_hi" in a["r"]
+                                 for a in args[1:])
+                if tuple_read or (pair and args[1].get("t") == "vcc"):
+                    numeric_use |= 3
+                else:
+                    halves = {a.get("t") for a in args[1:]}
+                    words = (1 if "vcc_lo" in halves else 0) | (2 if "vcc_hi" in halves else 0)
+                    scalar_copy = op == "s_mov_b32" and args[0]["k"] == "sgpr"
+                    if words and (scalar_copy or op.startswith(("v_dot", "s_add_u32", "v_min_f32"))):
+                        numeric_use |= words
+                    else:
+                        unsafe |= 3
+
+        raw = False
+        for ins in block:
+            op, args = _lane_masks.base_op(ins["op"]), ins["args"]
+            _, may_write, kill = _scalar_rw(ins)
+            if raw and op == "s_mov_b64" and args[1].get("t") == "vcc" and args[0]["k"] == "sgpr":
+                ins["vcc_data_pair"] = True
+            if may_write & vcc:
+                raw = bool(kill & vcc and (
+                    ins.get("vcc_data_pair") or (op.startswith(("s_load_", "s_buffer_load_"))
+                                                 and (args[0]["k"] == "slist" or args[0].get("t") == "vcc"))))
+
+
 def _postdominators(succ):
     """Immediate post-dominator `ipdom[b]` (Cooper-Harvey-Kennedy on reversed CFG with virtual exit `n`)."""
     n = len(succ)
@@ -747,8 +811,19 @@ def _holds_lane_mask(ins, x, lm_map):
         t = x.get("t", "")
         return t.startswith("exec") or (t.startswith("vcc") and "vcc" in lm_map)
     if k == "sgpr":
-        return all(x["r"] + i in lm_map for i in range(x.get("n", 1)))
+        n = x.get("n", 1)
+        if n == 2:
+            # Gen.holds_lane_mask takes a pair as a mask when one word is a mask and the other a constant 0 / -1
+            # (s_mov_b32 s5, 0 after a v_cmp into s[4:5]). `lm_map` has no constants, so one mask word is enough
+            # here; a pair with a data word too is then over-approximated, which only costs a fold (old #4480).
+            return x["r"] in lm_map or x["r"] + 1 in lm_map
+        return all(x["r"] + i in lm_map for i in range(n))
     return False
+
+
+def _has_any_lane_mask_word(x, lm_map):
+    """True if `x` is an SGPR operand with at least one register holding a lane mask."""
+    return x.get("k") == "sgpr" and any(x["r"] + i in lm_map for i in range(x.get("n", 1)))
 
 
 def _is_mask_op(ins, x, lm_map):
@@ -785,6 +860,11 @@ def _x_memory_order_access(op):
     return kind, reads, writes
 
 
+def _vcc_pair_collects_mask(ins, masks):
+    return ins.get("vcc_data_pair") and any(
+        _holds_lane_mask(ins, x, masks.get(id(ins), {})) for x in ins["args"][1:])
+
+
 def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
     """Inspect non-terminator instructions of a block for lane-local region safety.
 
@@ -816,7 +896,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             return False, _EMPTY_MEM_STATS, 0, (), ()
         flags = m[8]
         # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
-        if flags & _FLAG_FORBIDDEN_FOLD:
+        if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
             return False, _EMPTY_MEM_STATS, 0, (), ()
 
         acc = m[9]
@@ -862,7 +942,9 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
             else:  # _MASK_CHK_SCMP
                 lm = lane_masks.get(id(ins), {})
-                if any(_holds_lane_mask(ins, x, lm) for x in a):
+                if any(_holds_lane_mask(ins, x, lm) or
+                       (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                       for x in a):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
@@ -1182,7 +1264,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                 clean = False
                 continue
             flags = m[8]
-            if flags & _FLAG_FORBIDDEN_FOLD:
+            if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
                 clean = False
                 continue
             acc = m[9]
@@ -1231,7 +1313,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                         continue
                 else:  # _MASK_CHK_SCMP
                     lm = lane_masks.get(id(ins), {})
-                    if any(_holds_lane_mask(ins, x, lm) for x in a):
+                    if any(_holds_lane_mask(ins, x, lm) or
+                           (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                           for x in a):
                         clean = False
                         continue
 
@@ -1447,7 +1531,7 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if meta[1]:
         return False
     flags = meta[8]
-    if flags & _FLAG_ALWAYS_BARRIER:
+    if flags & _FLAG_ALWAYS_BARRIER or _vcc_pair_collects_mask(ins, lane_masks):
         return True
     mask_chk = meta[11]
     if not mask_chk:
@@ -1465,7 +1549,9 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if mask_chk == _MASK_CHK_MBCNT:
         return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
     lm = lane_masks.get(id(ins), {})
-    return any(_holds_lane_mask(ins, x, lm) for x in a)
+    return any(_holds_lane_mask(ins, x, lm) or
+               (meta[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+               for x in a)
 
 
 def _insn_may_barrier(ins, lane_masks, scc_live):

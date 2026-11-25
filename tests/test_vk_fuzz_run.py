@@ -6,8 +6,11 @@
 import contextlib
 import importlib
 import io
+import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 import unittest.mock as mock
 from pathlib import Path
@@ -89,6 +92,35 @@ class ProgramText(unittest.TestCase):
             leftovers = [p for p in Path(tmp).iterdir() if p.name.startswith("vk_fuzz_")]
             self.assertEqual(leftovers, [])
 
+    def test_read_dump_takes_the_first_wave_of_a_larger_buffer(self):
+        import struct
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = Path(tmp) / "d.bin"
+            # wave32, words=1: vk_compute_test's buffer is at least 64 words, so the dump is 64 words long. Each lane
+            # stores its own value, and the tail holds a sentinel that is not the harness fill, so a read that took
+            # the wrong words, the wrong order or the tail would not match.
+            sentinel = 0xDEADBEEF
+            self.assertNotEqual(sentinel, R.FILL)
+            dump.write_bytes(struct.pack("<64I", *([0x100 + lane for lane in range(32)] + [sentinel] * 32)))
+            lanes = R.read_dump(str(dump), 1, 32)
+            self.assertEqual(lanes, [[0x100 + lane] for lane in range(32)])
+            self.assertNotIn([sentinel], lanes)
+            # wave64, words=1 from a two-group dump (128 words): the buffer is longer than the request the other way
+            # round, and only the first 64 words are the wave's.
+            dump.write_bytes(struct.pack("<128I", *([0x200 + lane for lane in range(64)] + [sentinel] * 64)))
+            self.assertEqual(R.read_dump(str(dump), 1, 64), [[0x200 + lane] for lane in range(64)])
+            # An exact-size dump still reads as before.
+            dump.write_bytes(struct.pack("<128I", *range(128)))
+            lanes = R.read_dump(str(dump), 4, 32)
+            self.assertEqual(len(lanes), 32)
+            self.assertEqual(lanes[0], [0, 1, 2, 3])
+            self.assertEqual(lanes[31], [124, 125, 126, 127])
+            # Too short or missing: no result.
+            dump.write_bytes(struct.pack("<31I", *range(31)))
+            self.assertIsNone(R.read_dump(str(dump), 1, 32))
+            self.assertIsNone(R.read_dump(str(Path(tmp) / "missing.bin"), 1, 32))
+
     def test_judge_counts_skips_and_mismatches(self):
         import unittest.mock as mock
         obs = ["v_mov_b32 v8, v1", "v_mov_b32 v9, v2", "v_mov_b32 v10, v3", "v_mov_b32 v11, v4"]
@@ -105,9 +137,81 @@ class ProgramText(unittest.TestCase):
         self.assertFalse(R.all_skipped({"match": 1, "skip: x": 2}))
         self.assertFalse(R.all_skipped({"denormal": 1, "skip: x": 2}))
 
+    def _run_with_fake_gpu(self, tmp, outcomes, calls, run, retries=0):
+        """Run the real assembly/translation/GPU orchestration with synthetic child procedures."""
+        if R.SHADERS not in sys.path:
+            sys.path.insert(0, R.SHADERS)
+        import compute_fixture
+        import mc_command
+
+        (Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")).touch()
+
+        def child(cmd, *, env=None, **_kwargs):
+            if "--out" in cmd:
+                out = Path(cmd[cmd.index("--out") + 1])
+                out.mkdir()
+                (out / "index.json").write_text(json.dumps({f"cs_vkfuzz_{i}": {} for i in range(len(outcomes))}),
+                                                   encoding="utf-8", newline="\n")
+                for i in range(len(outcomes)):
+                    (out / f"cs_vkfuzz_{i}.spv").write_bytes(b"synthetic")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            i = int(Path(cmd[1]).stem.rsplit("_", 1)[1])
+            calls.append(i)
+            Path(env["VKC_DUMP"]).write_bytes(bytes(128))  # fresh, complete 32-lane, one-word dump
+            rc, stdout, stderr = outcomes[i]
+            return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+
+        mc_ok = subprocess.CompletedProcess([], 0, "v_mov_b32 v8, 0\n", "")
+        with mock.patch.object(mc_command, "mc_command", return_value=["synthetic-llvm-mc"]), \
+             mock.patch.object(mc_command, "run", return_value=mc_ok), \
+             mock.patch.object(compute_fixture, "compute_header", return_value=b"synthetic"), \
+             mock.patch.object(R.subprocess, "run", side_effect=child), \
+             mock.patch.dict(os.environ, {"VK_FUZZ_KEEP": ""}):
+            return run(tmp, retries)
+
+    def test_failed_gpu_exit_is_harness_error_even_with_fresh_dump_and_subgroup_warning(self):
+        lines = [["v_mov_b32 v8, 0"]]
+        for warning in ("compute subgroup size: 8 not available\n", "compute subgroup size: 32\n"):
+            with self.subTest(warning=warning), tempfile.TemporaryDirectory() as tmp:
+                calls = []
+                with self.assertRaisesRegex(RuntimeError, r"cs_vkfuzz_0: vk_compute_test exit 1") as error:
+                    self._run_with_fake_gpu(
+                        tmp, [(1, warning, "synthetic validation failure after dump\n")], calls,
+                        lambda folder, _retries: R.judge(lines, [[0]], R.exact_verdict, wave=32, words=1,
+                                                         build=folder, work_parent=folder))
+                self.assertIn("synthetic validation failure after dump", str(error.exception))
+                self.assertEqual(calls, [0, 0, 0])  # the existing retry budget is exhausted first
+                self.assertFalse(any(p.name.startswith("vk_fuzz_") for p in Path(tmp).iterdir()))
+
+    def test_successful_unpinned_and_unsupported_runs_still_skip(self):
+        outcomes = [(0, "compute subgroup size: 8 not available\n", ""),
+                    (77, "", "unsupported: no matching device\n"),
+                    (0, "compute subgroup size: 32\n", "")]
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            got = self._run_with_fake_gpu(
+                tmp, outcomes, calls,
+                lambda folder, retries: R.run_programs([["v_mov_b32 v8, 0"]] * 3, words=1, wave=32,
+                                                       build=folder, work_parent=folder, retries=retries))
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(got, ["the device can't run 32-lane subgroups (8 lanes)",
+                               "vk_compute_test: unsupported: no matching device", [0]])
+
 
 class Guard(unittest.TestCase):
     FUZZERS = ("pk16_diff", "vint_diff", "sdwa_diff", "wint_diff", "fmisc_diff")
+
+    def test_gpu_harness_exception_exits_two_in_each_caller(self):
+        for tool in self.FUZZERS:
+            mod = importlib.import_module(tool)
+            oracle = mock.Mock(device="synthetic", arch="gfx1030")
+            out = io.StringIO()
+            with self.subTest(tool=tool), \
+                 mock.patch.object(hw_oracle.runner, "open_oracle", return_value=oracle), \
+                 mock.patch.object(mod, "run_suite", side_effect=RuntimeError("vk_compute_test exit 1")), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(mod.main(["--oracle", "hw,vk", "--programs", "2"]), 2)
+            self.assertIn("harness error: vk_compute_test exit 1", out.getvalue())
 
     def test_vk_without_hw_is_a_usage_error(self):
         for tool in self.FUZZERS:

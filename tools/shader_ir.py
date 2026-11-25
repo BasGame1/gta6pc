@@ -9,6 +9,7 @@ As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything
 Usage: `python -I tools/shader_ir.py --help` lists the options.
 """
 import argparse
+import itertools
 import os
 import re
 import sys
@@ -16,6 +17,7 @@ from collections import Counter
 
 ENC = re.compile(r";\s*encoding:\s*\[([^\]]*)\]")
 HDR = re.compile(r"^;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
+INVALID_AT = re.compile(r"<stdin>:(\d+):(\d+): warning: invalid instruction encoding")
 SPECIAL = {"vcc", "vcc_lo", "vcc_hi", "exec", "exec_lo", "exec_hi", "m0", "scc", "null", "off", "src_scc",
            "src_execz", "src_vccz", "src_lds_direct", "src_shared_base", "src_shared_limit",
            "src_private_base", "src_private_limit", "src_pops_exiting_wave_id", "lds", "flat_scratch",
@@ -225,41 +227,52 @@ def parse_line(line):
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
-                      "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_trunc_f64", "v_ceil_f64",
-                      "v_rndne_f64", "v_floor_f64")):
+                      "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_ldexp_f64", "v_trunc_f64",
+                      "v_ceil_f64", "v_rndne_f64", "v_floor_f64")):
         for src, spelling in zip(args[1:], parts[1:]):
             # LLVM prints inline integers in decimal and the separate literal dword in hex,
             # even for two sources with the same numeric value (e.g. 0x1 and 1).
             if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
                 src["f64_literal"] = True
+                # The hex digits are the operand's printed width: LLVM pads nothing, so a value that
+                # fits one literal dword prints in at most 8 of them (docs/design.md, f64 literal sources).
+                m = re.search(r"0x([0-9a-fA-F]+)", spelling)
+                if m:
+                    src["literal_hex_digits"] = len(m.group(1))
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}
 
 
 def parse_file(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
     info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [], "invalid": 0}
-    m = HDR.match(lines[0]) if lines else None
-    pc = int(m.group(2), 16) if m else 0
-    info["code_start"] = pc
-    # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
-    # between the last printed instruction and it
-    info["code_end"] = int(m.group(3), 16) if m else None
-    start = 1 if (lines and not lines[0].startswith("\t")) else 0
-    for ln in lines[start:]:
-        if ln.startswith("; ---"):
-            break
-        if not ln.startswith("\t") or ln.lstrip().startswith("."):
-            continue
-        ins = parse_line(ln)
-        if not ins:
-            continue
-        ins["pc"] = pc
-        if ins["enc"]:
-            pc += len(ins["enc"]) // 2
-        info["insns"].append(ins)
-    tail = "\n".join(lines)
-    info["invalid"] = tail.count("invalid instruction encoding")
+    invalid_at = set()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        first = f.readline()
+        header = HDR.match(first)
+        pc = int(header.group(2), 16) if header else 0
+        info["code_start"] = pc
+        # the end of the code range the header declares (exclusive), None without a header: undecodable words can
+        # sit between the last printed instruction and it
+        info["code_end"] = int(header.group(3), 16) if header else None
+        body = True
+        # Older llvm-mc listings can have gigabytes of echoed source in their diagnostics.
+        for line in itertools.chain((first,), f):
+            info["invalid"] += line.count("invalid instruction encoding")
+            # Where llvm-mc rejected a word: tools/shader_disasm.py feeds it lines of "0xNN " bytes (5 characters a
+            # byte), one dword a line (one line of the whole code in older listings), starting at code_start, so
+            # the message's line and column give the byte offset. The decoder then moves on by 4 bytes.
+            for row, col in INVALID_AT.findall(line):
+                invalid_at.add(info["code_start"] + (int(row) - 1) * 4 + (int(col) - 1) // 5)
+            if line.startswith("; ---"):
+                body = False
+            if not body or not line.startswith("\t") or line.lstrip().startswith("."):
+                continue
+            ins = parse_line(line)
+            if ins:
+                ins["pc"] = pc
+                if ins["enc"]:
+                    pc += len(ins["enc"]) // 2
+                info["insns"].append(ins)
+    info["invalid_at"] = sorted(invalid_at)
     return info
 
 

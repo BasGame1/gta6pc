@@ -1,4 +1,8 @@
-"""Verify single-offset world_drawable_lookup predictions against normal model exports."""
+"""Verify single-offset world_drawable_lookup predictions against normal model exports.
+
+Source paths may be links to the same archive. Only file metadata is checked, never archive bytes;
+offline reports still work when their normalized source paths agree.
+"""
 import argparse
 from collections import Counter, defaultdict
 import json
@@ -11,10 +15,27 @@ import world_build
 import world_names
 
 
+def _same_archive(first, second):
+    if first == second:
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def archive_path(value):
     if not isinstance(value, str) or not value.strip():
         raise ValueError("expected a source archive path")
     return os.path.normcase(os.path.abspath(value))
+
+
+def _manifest_identity(handle, path):
+    info = os.fstat(handle.fileno())
+    # Fall back to the normalized resolved path when either device or inode is unavailable.
+    if info.st_dev and info.st_ino:
+        return ("inode", info.st_dev, info.st_ino)
+    return ("path", os.path.normcase(path))
 
 
 def verify(predictions, manifests):
@@ -25,10 +46,20 @@ def verify(predictions, manifests):
     observations = Counter()
     named_offsets = set()
     by_identity = defaultdict(set)
-    paths = dict.fromkeys(os.path.normcase(os.path.realpath(path)) for path in manifests)
-    for path in paths:
-        export = report_rows(path, "Items")
-        if archive_path(export.get("src")) != archive:
+    seen_manifests = set()
+    for path in manifests:
+        path = os.path.realpath(path)
+        with open(path, encoding="utf-8-sig") as handle:
+            identity = _manifest_identity(handle, path)
+            if identity in seen_manifests:
+                continue
+            seen_manifests.add(identity)
+            export = json.load(handle)
+        if not isinstance(export, dict) or not isinstance(export.get("Items"), list):
+            raise ValueError(f"{path}: expected a Items array")
+        if any(not isinstance(row, dict) for row in export["Items"]):
+            raise ValueError(f"{path}: non-object in Items")
+        if not _same_archive(archive_path(export.get("src")), archive):
             raise ValueError(f"{path}: different source archive from predictions")
         scan = export.get("Scan")
         if not isinstance(scan, dict):
@@ -106,7 +137,7 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass

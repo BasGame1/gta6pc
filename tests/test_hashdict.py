@@ -305,12 +305,15 @@ class CarveAndExtraCLITest(unittest.TestCase):
         meta_index = {
             "files": [
                 {"off": 32, "head": "5053494e1234", "type": "bin"},
+                {"off": 48, "head": "00000000", "type": "bin"},
             ]
         }
         with open(os.path.join(meta_dir, "index.json"), "w", encoding="utf-8") as f:
             json.dump(meta_index, f)
         with open(os.path.join(meta_dir, f"{32:012x}.bin"), "wb") as f:
             f.write(b"\x00\x00pso_metadata_token\x00\x00")
+        with open(os.path.join(meta_dir, f"{48:012x}.bin"), "wb") as f:
+            f.write(b"\x00custom_archive_asset\x00")
 
         # 3. Extra directory with filenames
         self.extra_dir = os.path.join(self.dir, "extra_files")
@@ -402,6 +405,31 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(self.out_json, encoding="utf-8") as f:
             self.assertEqual(json.load(f), previous)
 
+    def test_unreadable_extra_file_preserves_existing_dictionary(self):
+        previous = {"12345678": "keep"}
+        with open(self.out_json, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(previous, f)
+        real_open = open
+
+        def open_extra(path, *args, **kwargs):
+            if os.fspath(path) == self.extra_file:
+                raise PermissionError(errno.EACCES, "synthetic access denied", self.extra_file)
+            return real_open(path, *args, **kwargs)
+
+        command = [TOOL, self.carve_dir, "--extra", self.extra_file, "--out", self.out_json]
+        with (mock.patch.object(hashdict, "open", side_effect=open_extra, create=True),
+              mock.patch.object(sys, "argv", command),
+              mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+              mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr):
+            result = hashdict.main()
+
+        self.assertEqual(result, 2)
+        self.assertEqual(stderr.getvalue().splitlines(), [
+            f"ERROR: cannot read --extra input {self.extra_file}: synthetic access denied"
+        ])
+        with open(self.out_json, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), previous)
+
     def test_one_archive_folder_is_harvested_as_that_archive(self):
         # <work>/carve/common (its own index.json, as the gamedata_* tools take it) used to give an empty
         # dictionary with exit 0: only <carve>/<archive>/index.json was looked for.
@@ -417,6 +445,49 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         with open(self.out_json, encoding="utf-8") as f:
             self.assertEqual(json.load(f), {f"{hashdict.joaat('pso_metadata_token'):08x}": "pso_metadata_token"})
+
+    def archive_names(self, *args):
+        p = self.run_tool(self.carve_dir, "--out", self.out_json, *args)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.out_json, encoding="utf-8") as f:
+            return set(json.load(f).values())
+
+    def test_archives_list_ignores_spaces_and_empty_entries(self):
+        # "common, custom_pack" used to select only common: " custom_pack" matched no archive, silently
+        names = self.archive_names("--archives", " common, custom_pack ,,")
+        self.assertIn("common_archive_asset", names)
+        self.assertIn("custom_archive_asset", names)
+        self.assertIn("pso_metadata_token", names)
+        # an empty list harvests only the PSIN/RBF0 blobs
+        names = self.archive_names("--archives", "")
+        self.assertNotIn("common_archive_asset", names)
+        self.assertNotIn("custom_archive_asset", names)
+        self.assertIn("pso_metadata_token", names)
+
+    def test_archive_named_but_not_carved_is_a_usage_error(self):
+        previous = {"00000001": "previous_name"}
+        with open(self.out_json, "w", encoding="utf-8") as f:
+            json.dump(previous, f)
+        common = os.path.join(self.carve_dir, "common")
+        for carve, archives, message in (
+                (self.carve_dir, "comon,custom_pack", "--archives: comon not found"),
+                (self.carve_dir, "common, data", "--archives: data not found"),
+                # a one-archive folder holds that archive only
+                (common, "custom_pack", "(archives there: common)")):
+            p = self.run_tool(carve, "--out", self.out_json, "--archives", archives)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("usage:", p.stderr)
+            self.assertIn(message, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertEqual(p.stdout, "")
+            with open(self.out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), previous)
+
+    def test_default_archives_absent_from_a_partial_carve_are_not_an_error(self):
+        # the default list names data, script, ... which this carve lacks
+        names = self.archive_names()
+        self.assertIn("common_archive_asset", names)
+        self.assertIn("pso_metadata_token", names)
 
     def test_out_naming_a_one_archive_index_is_refused(self):
         index = os.path.join(self.carve_dir, "common", "index.json")

@@ -107,7 +107,7 @@ UNDEF = _Undef()
 # Operations whose result is undefined when an operand is (they have no side effect and no control).
 _PURE = frozenset({
     "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
-    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUConvert", "OpBitCount", "OpIEqual",
+    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUMod", "OpUConvert", "OpBitCount", "OpIEqual",
     "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
     "OpBitcast",
     "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
@@ -132,6 +132,25 @@ def ieee_nan(r, *operands):
     if r != r and not any(o != o for o in operands):
         return -math.nan
     return r
+
+
+def rsqrt_f64(x):
+    """1 / sqrt(x) for a finite binary64 x > 0, rounded once to nearest even (the result is always normal).
+
+    1.0 / math.sqrt(x) rounds the root and then the quotient, which can miss by one ulp. Here n = floor(r * 2^p),
+    with p chosen so n has about 64 bits, comes from an integer square root of the exact rational 4^p / x; the
+    remainder decides the rounding of n down to 53 bits."""
+    f = Fraction(x)
+    p = 64 - math.frexp(1.0 / math.sqrt(x))[1]
+    scaled = Fraction(4) ** p / f                    # (r * 2^p)^2, exactly
+    n = math.isqrt(scaled.numerator // scaled.denominator)
+    inexact = n * n != scaled
+    shift = n.bit_length() - 53
+    q, rem = divmod(n, 1 << shift)
+    half = 1 << (shift - 1)
+    if rem > half or (rem == half and (inexact or q & 1)):
+        q += 1
+    return math.ldexp(q, shift - p)
 
 
 class _F32(float):
@@ -309,6 +328,8 @@ class _Types:
             return tuple(self.zero(k[1]) for _ in range(k[2]))
         if k[0] == "arr":
             return [self.zero(k[1]) for _ in range(k[2])]
+        if k[0] == "struct":
+            return [self.zero(m) for m in k[1]]        # a list, so OpAccessChain can select a member
         raise UnsupportedConstruct(f"zero value of type {name} ({k[0]})")
 
     def size(self, name):
@@ -359,7 +380,9 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     (missing words read as zero). `memory` is a mutable {byte_address: word} mapping used for
     PhysicalStorageBuffer loads and stores.
 
-    Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns.
+    Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns, a
+    bool as 0 or 1, and an aggregate (a mesh shader's arrayed outputs) as its scalars in order. A mesh shader's
+    result also has "OpSetMeshOutputsEXT": (vertex count, primitive count) once that instruction has run.
     A module with a subgroup operation is rejected here; see run_workgroup.
     """
     gen = _invocation(text, inputs, push_constants, memory)
@@ -539,6 +562,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
     first_fn = None
     body = []
     outputs = []
+    mesh_counts = []            # the OpSetMeshOutputsEXT operands, once it has run
 
     def val(x):
         if x in values:
@@ -732,6 +756,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         if op == "OpKill":
             killed = True
             break
+        if op == "OpSwitch":
+            key = val(a[0])
+            mask = wmask(id_type[a[0]])
+            target = next((label for literal, label in zip(a[2::2], a[3::2])
+                           if int(literal, 0) & mask == key & mask), a[1])
+            op, a = "OpBranch", [target]
         if op == "OpBranch":
             if a[0] not in labels:
                 raise UnsupportedConstruct(f"unknown branch target {a[0]}")
@@ -879,6 +909,21 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             else:
                 p[0][p[1]] = new & MASK
             values[res] = old
+        elif op == "OpAtomicStore":
+            # <pointer> <scope> <semantics> <value>, no result: with invocations run one at a time, a plain store of
+            # the 32-bit word to the same pointers the atomics above take.
+            p, v = pointers[a[0]], val(a[3])
+            if p[0] == "pc":
+                raise UnsupportedConstruct(f"{op} on a PushConstant")
+            if isinstance(v, bool) or not isinstance(v, int) or v > MASK:
+                raise UnsupportedConstruct(f"{op} of a value that is not a 32-bit integer")
+            if p[0] == "psb":
+                memory[psb_word(p[1])] = v
+            else:
+                old = deref(p)
+                if isinstance(old, bool) or not isinstance(old, int):
+                    raise UnsupportedConstruct(f"{op} on a variable element that is not a 32-bit integer")
+                p[0][p[1]] = v
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
                 raise UnsupportedConstruct("OpSelect with a non-scalar-bool condition")
@@ -949,6 +994,9 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             values[res] = (val(a[1]) + val(a[2])) & wmask(a[0])
         elif op == "OpISub":
             values[res] = (val(a[1]) - val(a[2])) & wmask(a[0])
+        elif op == "OpUMod":
+            divisor = val(a[2]) & wmask(a[0])
+            values[res] = (val(a[1]) & wmask(a[0])) % divisor if divisor else UNDEF
         elif op == "OpIMul":
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
         elif op == "OpUConvert":
@@ -1010,6 +1058,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             # every earlier instruction, and with shared Workgroup memory sees the others' writes). run_fragment
             # refuses it, as it does a subgroup operation: a barrier belongs to a workgroup.
             yield (op, pc - 1, None, None)
+        elif op == "OpSetMeshOutputsEXT":
+            # <vertex count> <primitive count> (SPV_EXT_mesh_shader). The invocation's result reports them under
+            # this opcode's name. The extension allows one call per invocation.
+            if mesh_counts:
+                raise InvalidModule(f"{line!r}: OpSetMeshOutputsEXT runs a second time")
+            mesh_counts[:] = [val(a[0]), val(a[1])]
         elif op == "OpGroupNonUniformBroadcastFirst":
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformBroadcastFirst other than a Subgroup-scope integer")
@@ -1062,9 +1116,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
             if types.t[a[0]] == ("float", 64):
-                if op != "OpFMul":
-                    raise UnsupportedConstruct(f"{op} on binary64")
-                values[res] = x * y
+                # Python floats are binary64 with round to nearest even: the result needs no rounding of its own.
+                if op == "OpFMul":
+                    values[res] = x * y
+                elif op == "OpFDiv" and y == 0.0:
+                    raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")   # as for binary32
+                else:
+                    r = x + y if op == "OpFAdd" else x - y if op == "OpFSub" else (
+                        math.nan if math.isinf(x) and math.isinf(y) else x / y)
+                    values[res] = ieee_nan(r, x, y)
                 continue
 
             def _fdiv(p, q):
@@ -1234,6 +1294,10 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                     values[res] = {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
                 elif name == "Log2":
                     values[res] = f32(math.log2(x))
+                elif types.t[a[0]] == ("float", 64):
+                    # A double result stays binary64: math.sqrt is correctly rounded, and 1.0 / math.sqrt(x)
+                    # would round twice, so the inverse root is rounded once from the exact value.
+                    values[res] = math.sqrt(x) if name == "Sqrt" else rsqrt_f64(x)
                 elif name == "Sqrt":
                     values[res] = f32(math.sqrt(x))         # sqrt(-0.0) is -0.0
                 else:
@@ -1293,8 +1357,17 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
     if killed:
         return {}
     result = {}
+
+    def flat(v):
+        """The scalars of an output in order: vector components, array elements and struct members."""
+        if isinstance(v, (list, tuple)):
+            for x in v:
+                yield from flat(x)
+        else:
+            yield v
+
     for name in outputs:
-        v = var_box[name][0]
-        flat = v if isinstance(v, tuple) else (v,)
-        result[name] = tuple(f32_bits(x) if isinstance(x, float) else x & MASK for x in flat)
+        result[name] = tuple(f32_bits(x) if isinstance(x, float) else x & MASK for x in flat(var_box[name][0]))
+    if mesh_counts:
+        result["OpSetMeshOutputsEXT"] = tuple(mesh_counts)
     return result

@@ -72,9 +72,8 @@ class F64OutputModifiersTest(unittest.TestCase):
         for index, register in ((0, "%c4"), (1, "%c5")):
             word = result(rf"OpCompositeExtract %uint {pair} {index}")
             dest = result(rf"OpAccessChain %_ptr_Function_uint %vgpr {register}")
-            m_sel = re.search(rf"^ *(%\w+) = OpSelect %uint %\w+ {word} %\w+$", spv, re.M)
-            stored = m_sel.group(1) if m_sel else word
-            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {stored}$")
+            # This straight-line fixture keeps EXEC full, so each word is stored directly.
+            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {word}$")
         # Every f64 add and scale keeps its own rounding (no_contraction decorates all float arithmetic).
         for op in re.findall(r"(?m)^ *(%\w+) = Op(?:FAdd|FMul) %double ", spv):
             self.assertRegex(spv, rf"(?m)^ *OpDecorate {op} NoContraction$")

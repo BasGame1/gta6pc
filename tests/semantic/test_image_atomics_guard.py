@@ -73,18 +73,71 @@ def parse_blocks(spv):
     return blocks
 
 
+def defs_of(spv):
+    """Map result id -> operand ids on the right-hand side, for every `%id = Op...` line."""
+    defs = {}
+    for raw in spv.splitlines():
+        s = raw.strip()
+        if " = Op" not in s or s.startswith("Op"):
+            continue
+        lhs, rhs = s.split(" = ", 1)
+        defs[lhs.strip()] = re.findall(r"%\w+", rhs)
+    return defs
+
+
+def derived_from(spv, cond):
+    """Whether `cond` is a value computed from an `OpLoad %bool %active` result.
+
+    A shader that writes EXEC gets a lane-exact guard rather than the load itself: `s_and_b32 exec_lo, exec_lo, s4`
+    lowers to `OpSelect`/`OpBitwiseAnd`/`OpShiftRightLogical`/`OpINotEqual` over the loaded boolean, and the branch
+    tests the last of those (`%t34` in the fixture below). Walking the definition chain is what tells that apart
+    from a guard that never consulted the lane mask at all.
+    """
+    active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    if cond in active_loads:
+        return True
+    if not active_loads:
+        return False
+    defs = defs_of(spv)
+    seen = set()
+    stack = [cond]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if cur in active_loads:
+            return True
+        for operand in defs.get(cur, ()):
+            if operand not in seen:
+                stack.append(operand)
+    return False
+
+
 def find_guarded_texel_block(spv):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    conditional branch whose condition is an OpLoad %bool %active (or a value computed from one), or the constant
+    %true when the shader has no OpStore to %active, and return that block's instructions."""
     blocks = parse_blocks(spv)
-    active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M)) | {"%true"}
+    # A shader that never writes EXEC leaves every lane active, and the translator folds `if (%active)` to
+    # `if (%true)` there, which guards nothing because nothing can be inactive. Accept that constant, and
+    # only that constant: a shader with an OpStore to %active still needs the lane mask to protect the access.
+    exec_is_constant_true = not re.search(r"^\s*OpStore %active\b", spv, re.M)
+    # A tagged 3D view additionally requires a valid R32_UINT descriptor. In a shader
+    # with constant EXEC its predicate is (true && descriptor_ok). An EXEC-writing
+    # shader still has to derive its condition from the live lane mask.
+    folded_active_and = set(re.findall(
+        r"^\s*(%\w+) = OpLogicalAnd %bool (?:%true %\w+|%\w+ %true)$", spv, re.M))
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
                 br = insns[i + 1]
                 m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
-                if m and m.group(1) in active_loads:
+                if not m:
+                    continue
+                cond = m.group(1)
+                if (exec_is_constant_true and (cond == "%true" or cond in folded_active_and)) or derived_from(spv, cond):
                     guarded_targets.add(m.group(2))
     found = []
     for lbl, insns in blocks.items():
@@ -95,6 +148,27 @@ def find_guarded_texel_block(spv):
     if not found:
         raise AssertionError("No OpImageTexelPointer emitted")
     return found
+
+
+def texel_guard_condition(spv):
+    """The condition of the `OpSelectionMerge` branch that enters the block holding the
+    `OpImageTexelPointer`: the `OpLoad %bool %active` result, a value computed from one, or `%true` when the
+    translator folded it."""
+    blocks = parse_blocks(spv)
+    target = None
+    for lbl, insns in blocks.items():
+        if any("= OpImageTexelPointer " in ln for ln in insns):
+            target = lbl
+            break
+    if target is None:
+        raise AssertionError("No OpImageTexelPointer emitted")
+    for insns in blocks.values():
+        for i, ln in enumerate(insns):
+            if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
+                m = re.match(r"OpBranchConditional (%\w+) (%\w+)", insns[i + 1])
+                if m and m.group(2) == target:
+                    return m.group(1)
+    raise AssertionError(f"the block with the OpImageTexelPointer {target} is not entered from a selection")
 
 
 def vgpr_ptrs(spv, reg_idx):
@@ -148,6 +222,95 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                         )
                         self.assertEqual(has_glc_store, bool(glc),
                                          f"glc={bool(glc)} mismatch for v0 write-back in guarded block")
+
+    def test_dynamic_exec_keeps_the_real_active_guard(self):
+        # Every other case here leaves EXEC alone, so the translator folds the guard to `if (%true)` (#4473) and
+        # find_guarded_texel_block accepts that constant. These shaders switch lanes off at run time, so the
+        # translator stores to %active and the atomic must be entered through a branch on the loaded %active: a
+        # lane the shader switched off must not reach OpImageTexelPointer / OpAtomic*. Both EXEC writes come from a
+        # per-lane compare (VCC), not from a computed SGPR value, which is SHADER-1264's path.
+        exec_writes = {
+            "and_saveexec": ["v_cmp_gt_u32_e32 vcc_lo, 2, v5", "s_and_saveexec_b32 s12, vcc_lo"],
+            "cmpx": ["v_cmpx_gt_u32_e32 2, v5"],
+        }
+        atomics = [
+            ("image_atomic_add", "v0", "dmask:0x1", "OpAtomicIAdd"),
+            ("image_atomic_swap", "v0", "dmask:0x1", "OpAtomicExchange"),
+            ("image_atomic_inc", "v0", "dmask:0x1", "OpAtomicCompareExchange"),
+            ("image_atomic_cmpswap", "v[0:1]", "dmask:0x3", "OpAtomicCompareExchange"),
+        ]
+        for form, pre in exec_writes.items():
+            for op, data, dmask, spv_op in atomics:
+                for dim, addr in (("dim:SQ_RSRC_IMG_2D", "v[1:2]"), ("dim:SQ_RSRC_IMG_3D", "v[1:3]")):
+                    with self.subTest(exec_write=form, op=op, dim=dim):
+                        spv = translate(pre + [
+                            "v_mov_b32_e32 v0, 5",
+                            "v_mov_b32_e32 v1, 1",
+                            "v_mov_b32_e32 v2, 2",
+                            "v_mov_b32_e32 v3, 3",
+                            f"{op} {data}, {addr}, s[4:11] {dmask} {dim} unorm glc",
+                        ])
+                        validate_spirv(spv)
+                        self.assertRegex(spv, r"(?m)^\s*OpStore %active\b",
+                                         "an EXEC write must reach %active, or this case tests nothing")
+                        (label, _insns), = find_guarded_texel_block(spv)
+                        self.assertIn(f"= {spv_op} %uint ", spv)
+                        # The walker must not accept the folded constant here: put %true in place of the real
+                        # condition and it has to reject the module.
+                        branch = re.search(rf"(?m)^\s*OpBranchConditional (%\w+) {re.escape(label)} ", spv)
+                        self.assertIsNotNone(branch, f"no conditional branch enters {label}")
+                        self.assertNotEqual(branch.group(1), "%true")
+                        forged = spv[:branch.start(1)] + "%true" + spv[branch.end(1):]
+                        with self.assertRaisesRegex(AssertionError, "unguarded block"):
+                            find_guarded_texel_block(forged)
+
+    def test_a_shader_that_writes_exec_guards_on_the_load_not_the_folded_constant(self):
+        """The `%true` acceptance above only holds when nothing can be inactive. A shader that writes EXEC must
+        still branch on a value computed from the `OpLoad %bool %active` result, so the real guard stays exercised:
+        this case fails if the helper's constant path ever widens to a shader with an `OpStore %active`.
+
+        With `s_and_b32 exec_lo, exec_lo, s4` the translator cannot test the load directly, because the lane's bit
+        of the new mask is `exec_value & (1 << lane)`. It emits that chain and branches on the last comparison, so
+        the assertion is that the branch condition reaches the load, not that it is the load."""
+        lines = [
+            "v_mov_b32_e32 v0, 5",
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 2",
+            "v_mov_b32_e32 v3, 3",
+            "s_mov_b32 s4, 1",
+            "s_and_b32 exec_lo, exec_lo, s4",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+        ]
+        spv = translate(lines)
+        validate_spirv(spv)
+        self.assertIn("OpStore %active", spv, "the fixture must actually write EXEC")
+        guarded = find_guarded_texel_block(spv)
+        self.assertEqual(len(guarded), 1)
+        condition = texel_guard_condition(spv)
+        self.assertNotEqual(condition, "%true", "an EXEC-writing shader must not be guarded on the folded constant")
+        self.assertTrue(derived_from(spv, condition), f"guard {condition} does not reach OpLoad %bool %active")
+        self.assertFalse(derived_from(spv, "%true"))
+        insns = guarded[0][1]
+        self.assertTrue(any("= OpAccessChain " in ln for ln in insns))
+        self.assertTrue(any("= OpImageTexelPointer " in ln for ln in insns))
+        self.assertTrue(any("= OpAtomicIAdd %uint " in ln for ln in insns))
+
+    def test_volume_descriptor_guard_keeps_dynamic_exec(self):
+        spv = translate([
+            "s_and_b32 exec_lo, exec_lo, s4",
+            "image_atomic_add v0, v[1:3], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm",
+        ])
+        validate_spirv(spv)
+        self.assertEqual(len(find_guarded_texel_block(spv)), 1)
+        cond = texel_guard_condition(spv)
+        guard = re.search(rf"^[ \t]*{cond} = OpLogicalAnd %bool (%\w+) (%\w+)$", spv, re.M)
+        self.assertIsNotNone(guard)
+        active, descriptor_ok = guard.groups()
+        self.assertTrue(derived_from(spv, active))
+        self.assertFalse(derived_from(spv, descriptor_ok))
+        broken = spv.replace(guard[0], f"{cond} = OpLogicalAnd %bool %true {descriptor_ok}")
+        with self.assertRaisesRegex(AssertionError, "unguarded block"):
+            find_guarded_texel_block(broken)
 
     def test_image_atomic_inc_and_dec_cas_2d_3d_and_a16(self):
         cases = [

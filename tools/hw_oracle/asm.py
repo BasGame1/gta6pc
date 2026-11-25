@@ -43,7 +43,7 @@ def _is_inline(tok):
 
 def literals(line):
     """The distinct 32-bit literal values an instruction needs (SOPK immediates are not literals)."""
-    op, _, rest = line.partition(" ")
+    op, _, rest = line.strip().partition(" ")
     if not op.startswith("s_") or op.rstrip("_") in _LITERAL_FREE or re.match(r"s_cmpk_", op):
         return set()
     toks = [t.strip() for t in rest.split(",")] if rest else []
@@ -55,10 +55,11 @@ def skip_reason(lines, arch):
     """Why a program cannot be run on this architecture, or None. Hardware allows one literal per instruction."""
     removed = {"gfx10": {}, "gfx11": GFX11_REMOVED, "gfx12": GFX12_REMOVED}[family(arch)]
     for line in lines:
-        op = line.partition(" ")[0]
+        stripped = line.strip()
+        op = stripped.partition(" ")[0]
         if op in removed:
             return f"{op}: {removed[op]}"
-        if len(literals(line)) > 1:
+        if len(literals(stripped)) > 1:
             return "two different literals in one instruction (not encodable)"
     return None
 
@@ -122,9 +123,11 @@ def is_gfx1170_or_later(arch):
 
 
 def rdna23_skip_reason(arch):
-    """Why a fuzzer or test written for RDNA2 and RDNA3 cannot run on this GPU, or None. AMD clang (rocm-sdk-core 10.0.0)
-    rejects s_barrier and some 16-bit and memory operands for gfx1201 (TEST-873, found by @PeterGrieffindor in #3918),
-    which fails every program of a chunk; on gfx1170+ the caller reports a skip instead."""
+    """Why a hardware suite whose kernels set the MODE fields gfx1170+ cannot encode cannot run on this GPU, or
+    None. Remaining users: the OnHardware guards of f32_fuzz and f16_trans_sweep, whose MODE probes set IEEE and
+    DX10_CLAMP, which AMD clang (rocm-sdk-core 10.0.0) rejects for gfx1170+ (FUZZ-43) so the probe cannot run there.
+    The fuzzers whose kernels do assemble there gate per family (valu_fuzz.hw_family_skip_reason) or per program
+    (lds_fuzz.hw_skip_reason) instead of taking this blanket reason."""
     if not is_gfx1170_or_later(arch):
         return None
     return f"{arch} (GFX11.7 or GFX12) is not RDNA2 or RDNA3: the kernels here do not assemble for it"

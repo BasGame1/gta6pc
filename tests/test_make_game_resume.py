@@ -35,28 +35,23 @@ class ResumeShardsTest(unittest.TestCase):
         spirv = self.spirv
 
         class FakeProc:
-            def __init__(self, args, **kwargs):
+            def __init__(self, args):
                 self.i = int(args[args.index("--shard") + 1].split("/")[0])
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
-                self.returncode = 1 if self.i in crash else 0
-                if self.returncode == 0:
-                    with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
-                        json.dump({"index": self.i, "count": self.n}, f)
-                    with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
-                        json.dump({"tag": tag, "n": self.n}, f)
+                self.returncode = self.finish()
 
             def poll(self):
                 return self.returncode
 
-            def wait(self, timeout=None):
-                return self.returncode
-
-            def terminate(self):
-                pass
-
-            def kill(self):
-                pass
+            def finish(self):
+                if self.i in crash:
+                    return 1
+                with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
+                    json.dump({"index": self.i, "count": self.n}, f)
+                with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
+                    json.dump({"tag": tag, "n": self.n}, f)
+                return 0
         with mock.patch.object(make_game.subprocess, "Popen", side_effect=FakeProc), \
                 mock.patch.object(make_game, "py") as py, \
                 mock.patch.object(make_game, "translator_digest", return_value=digest), \

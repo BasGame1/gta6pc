@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -183,6 +184,63 @@ bool host_renames_case(const std::filesystem::path& folder) {
 
 void run_checks(const std::filesystem::path& root);
 
+// Title memory committed on first touch, as xmem maps physical pages: a view of a reserve-only pagefile section whose
+// pages a vectored handler commits when user-mode code faults on them. The kernel's write in ReadFile raises no such
+// fault, so the host ReadFile fails with ERROR_NOACCESS; the shim commits the pages and reads again.
+char* g_first_touch = nullptr;
+SIZE_T g_first_touch_size = 0;
+
+LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* r = info->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    auto* at = reinterpret_cast<char*>(r->ExceptionInformation[1]);
+    if (at < g_first_touch || at >= g_first_touch + g_first_touch_size) return EXCEPTION_CONTINUE_SEARCH;
+    auto* page = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(at) & ~uintptr_t{0xfff});
+    return VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                  : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void check_read_file_first_touch(const std::filesystem::path& root) {
+    using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+    const auto shim_read = reinterpret_cast<ReadFileFn>(rt::shims::find("kernel32.dll", "ReadFile"));
+    check(shim_read != nullptr, "ReadFile is served by the file shims");
+    if (!shim_read) return;
+
+    std::filesystem::create_directories(root);
+    const std::filesystem::path file = root / "first_touch.bin";
+    constexpr DWORD kSize = 3 * 0x10000 + 123;  // crosses several pages and ends inside one
+    std::vector<unsigned char> data(kSize);
+    for (DWORD i = 0; i < kSize; ++i) data[i] = static_cast<unsigned char>(i * 7 + 3);
+    std::ofstream(file, std::ios::binary).write(reinterpret_cast<const char*>(data.data()), kSize);
+
+    g_first_touch_size = 4 * 0x10000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0,
+                                        static_cast<DWORD>(g_first_touch_size), nullptr);
+    g_first_touch = section ? static_cast<char*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0)) : nullptr;
+    check(g_first_touch != nullptr, "a reserve-only section view stands in for first-touch title memory");
+    if (!g_first_touch) return;
+    void* const handler = AddVectoredExceptionHandler(1, &commit_on_touch);
+
+    auto read_into_view = [&](ReadFileFn read) {
+        HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        DWORD got = 0;
+        const BOOL ok = read(h, g_first_touch + 0x800, kSize, &got, nullptr);
+        const DWORD error = ok ? 0 : GetLastError();
+        CloseHandle(h);
+        return std::make_pair(ok ? got : 0, error);
+    };
+    const auto host = read_into_view(&::ReadFile);
+    check(host.second == ERROR_NOACCESS, "the host ReadFile into uncommitted pages fails with ERROR_NOACCESS");
+    const auto shimmed = read_into_view(shim_read);
+    check(shimmed.second == 0 && shimmed.first == kSize, "the shimmed ReadFile commits the pages and reads it all");
+    check(std::memcmp(g_first_touch + 0x800, data.data(), kSize) == 0, "the bytes read are the file's");
+
+    RemoveVectoredExceptionHandler(handler);
+    UnmapViewOfFile(g_first_touch);
+    CloseHandle(section);
+    g_first_touch = nullptr;
+}
+
 }  // namespace
 
 int main() {
@@ -198,6 +256,7 @@ int main() {
     // An exception from one check (std::filesystem throws on a host error) ends the checks, not the run: it is a
     // failure, the folder is still removed and the summary is still printed.
     try {
+        check_read_file_first_touch(root / "first_touch");
         run_checks(root);
     } catch (const std::exception& e) {
         check(false, (std::string("the checks run to the end (stopped by: ") + e.what() + ")").c_str());
@@ -492,8 +551,8 @@ void run_checks(const std::filesystem::path& root) {
         check(delete_w(L"GAME:\\data\\bye.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "deleting an already hidden file reports ERROR_FILE_NOT_FOUND");
         SetLastError(0);
-        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
-              "deleting a file that never existed reports ERROR_FILE_NOT_FOUND");
+        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "deleting a file in a folder that never existed reports ERROR_PATH_NOT_FOUND");
 
         // Deleting a nested package file creates parent directories inside .gta6rt-deleted/; those marker parent
         // directories must not hide the corresponding ancestor directories in the package.
@@ -709,6 +768,88 @@ void run_checks(const std::filesystem::path& root) {
               "and the new folder is empty: only . and ..");
     }
 
+    {
+        const std::filesystem::path host = root / "host_missing";
+        write_path(host / "file.txt", "file");
+        const std::wstring host_dest = (host / "dest.txt").wstring();
+        auto error_of = [](BOOL ok) { return ok ? DWORD{0} : GetLastError(); };
+        struct Name {
+            const wchar_t* game;
+            std::filesystem::path host;
+            DWORD expected;
+            const char* what;
+        };
+        const Name names[] = {
+            {L"GAME:\\nowhere\\x.txt", host / "nowhere" / "x.txt", ERROR_PATH_NOT_FOUND, "inside a missing folder"},
+            {L"GAME:\\misc\\keep.txt\\x.txt", host / "file.txt" / "x.txt", ERROR_PATH_NOT_FOUND, "below a file"},
+            {L"GAME:\\misc\\absent.txt", host / "absent.txt", ERROR_FILE_NOT_FOUND, "missing from a folder that exists"},
+        };
+        for (const Name& n : names) {
+            const std::wstring native = n.host.wstring();
+            const std::string suffix = std::string(" of a name ") + n.what + " fails as on the host";
+            SetLastError(0);
+            const DWORD host_delete = error_of(::DeleteFileW(native.c_str()));
+            SetLastError(0);
+            check(error_of(delete_w(n.game)) == n.expected && host_delete == n.expected, ("DeleteFileW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_rmdir = error_of(::RemoveDirectoryW(native.c_str()));
+            SetLastError(0);
+            check(error_of(rmdir_w(n.game)) == n.expected && host_rmdir == n.expected,
+                  ("RemoveDirectoryW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_setattr = error_of(::SetFileAttributesW(native.c_str(), FILE_ATTRIBUTE_NORMAL));
+            SetLastError(0);
+            check(error_of(setattr_w(n.game, FILE_ATTRIBUTE_NORMAL)) == n.expected && host_setattr == n.expected,
+                  ("SetFileAttributesW" + suffix).c_str());
+            SetLastError(0);
+            const DWORD host_move = error_of(::MoveFileExW(native.c_str(), host_dest.c_str(), MOVEFILE_REPLACE_EXISTING));
+            SetLastError(0);
+            check(error_of(move_ex_w(n.game, L"GAME:\\misc\\dest.txt", MOVEFILE_REPLACE_EXISTING)) == n.expected &&
+                      host_move == n.expected,
+                  ("MoveFileExW" + suffix).c_str());
+        }
+        check(!std::filesystem::exists(overlay / "nowhere") && !std::filesystem::exists(overlay / "misc" / "dest.txt"),
+              "and none of them leaves anything in the overlay");
+    }
+    // Recreating a removed package directory clears its own marker, but not nested deletion markers.
+    {
+        std::filesystem::create_directories(package / "recreate_dir");
+        const auto mark = overlay / ".gta6rt-deleted" / "recreate_dir" / ".gta6rt-dir";
+        check(rmdir_w(L"GAME:\\recreate_dir") != FALSE && std::filesystem::exists(mark),
+              "removing a package directory creates its marker");
+        check(mkdir_w(L"GAME:\\recreate_dir", nullptr) != FALSE, "recreating the package directory succeeds");
+        const DWORD attrs = attributes_w(L"GAME:\\recreate_dir");
+        check(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY), "recreated directory has directory attributes");
+        check(count(list(first_w, next_w, find_close, L"GAME:\\*"), L"recreate_dir") == 1,
+              "recreated directory is listed once");
+        check(!std::filesystem::exists(mark), "recreated directory has no removal marker");
+        check(mkdir_w(L"GAME:\\never_removed_dir", nullptr) != FALSE &&
+                  std::filesystem::is_directory(overlay / "never_removed_dir") &&
+                  !std::filesystem::exists(overlay / ".gta6rt-deleted" / "never_removed_dir"),
+              "creating a never-removed directory is unchanged");
+    }
+
+    // A marker held without delete sharing makes recreation fail and rolls back the overlay directory.
+    {
+        std::filesystem::create_directories(package / "held_marker_dir");
+        const auto mark = overlay / ".gta6rt-deleted" / "held_marker_dir" / ".gta6rt-dir";
+        check(rmdir_w(L"GAME:\\held_marker_dir") != FALSE, "removing the directory creates a marker to hold");
+        const HANDLE held = ::CreateFileW(mark.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(held != INVALID_HANDLE_VALUE, "opened the removal marker without delete sharing");
+        if (held != INVALID_HANDLE_VALUE) {
+            const BOOL created = mkdir_w(L"GAME:\\held_marker_dir", nullptr);
+            const DWORD error = GetLastError();
+            check(!created && (error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED),
+                  "recreating a directory reports the marker deletion error");
+            check(!std::filesystem::exists(overlay / "held_marker_dir") && std::filesystem::exists(mark),
+                  "failed recreation removes the overlay directory and keeps the marker");
+            ::CloseHandle(held);
+            check(mkdir_w(L"GAME:\\held_marker_dir", nullptr) != FALSE,
+                  "recreating the directory succeeds after releasing the marker");
+        }
+    }
+
     // MoveFile: the destination is in the overlay; a moved package file is deleted by a marker.
     {
         check(move_w(L"GAME:\\misc\\one.txt", L"GAME:\\misc\\moved.txt") != FALSE, "MoveFileW moves a package file");
@@ -738,7 +879,9 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\misc", L"GAME:\\misc2") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a package folder is not moved");
         SetLastError(0);
-        check(move_w(L"GAME:\\misc\\keep.txt", (root / "host.txt").c_str()) == FALSE &&
+        // G: and T: outside the configured roots are console aliases, even when TEMP uses that host drive.
+        // Paths within the synthetic package root are explicitly host paths on every drive.
+        check(move_w(L"GAME:\\misc\\keep.txt", (package / "host.txt").c_str()) == FALSE &&
                   GetLastError() == ERROR_NOT_SAME_DEVICE,
               "a move between GAME: and a host path is refused as cross-volume");
         SetLastError(0);
@@ -782,7 +925,8 @@ void run_checks(const std::filesystem::path& root) {
         check(copy_a("GAME:\\misc\\keep.txt", "GAME:\\misc\\target.txt", FALSE) != FALSE &&
                   read_path(overlay / "misc" / "target.txt") == "keep" && read_path(package / "misc" / "target.txt") == "target",
               "CopyFileA overwrites through the overlay and leaves the package file alone");
-        const std::filesystem::path host_copy = root / "host_copy.txt";
+        // Keep this host path inside a configured root too; an unqualified G:/T: path is virtual.
+        const std::filesystem::path host_copy = package / "host_copy.txt";
         check(copy_w(L"GAME:\\misc\\keep.txt", host_copy.c_str(), TRUE) != FALSE && read_path(host_copy) == "keep",
               "a copy from GAME: to a host path works");
         check(copy_ex_w(host_copy.c_str(), L"GAME:\\cache\\from_host.txt", nullptr, nullptr, nullptr, COPY_FILE_FAIL_IF_EXISTS) !=
@@ -832,6 +976,19 @@ void run_checks(const std::filesystem::path& root) {
             BOOL cancel = TRUE;
             block.dwCopyFlags = 0;
             block.pfCancel = &cancel;
+            const auto parent = fallback ? "copy2_package_fallback" : "copy2_package_host";
+            const auto destination = fallback ? L"GAME:\\copy2_package_fallback\\copy.txt" :
+                                                L"GAME:\\copy2_package_host\\copy.txt";
+            std::filesystem::create_directories(package / parent);
+            check(copy2(L"GAME:\\misc\\keep.txt", destination, &block) ==
+                          HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
+                      !std::filesystem::exists(overlay / parent),
+                  ("a cancelled copy does not create its overlay parent" + mode).c_str());
+            cancel = FALSE;
+            check(copy2(L"GAME:\\misc\\keep.txt", destination, &block) == S_OK &&
+                      read_path(overlay / parent / "copy.txt") == "keep",
+                  ("an uncancelled copy creates its overlay parent" + mode).c_str());
+            cancel = TRUE;
             check(copy2(L"GAME:\\misc\\keep.txt", to(L"cancelled.txt").c_str(), &block) ==
                           HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
                       !std::filesystem::exists(out / "cancelled.txt"),
@@ -1385,6 +1542,122 @@ void run_checks(const std::filesystem::path& root) {
         SetLastError(0);
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
+    }
+
+    // The guest can reach a deeply nested file even when its executable and the configured roots are short.
+    // Use the explicit Win32 namespace to set up the fixtures, independently of the shim under test.
+    {
+        const auto extended = [](const std::filesystem::path& path) {
+            const auto& native = path.native();
+            if (native.starts_with(L"\\\\?\\")) return path;
+            if (native.starts_with(L"\\\\")) return std::filesystem::path(L"\\\\?\\UNC\\" + native.substr(2));
+            return std::filesystem::path(L"\\\\?\\" + native);
+        };
+        const auto fixture = root / "long_paths";
+        const auto long_package = fixture / "package";
+        const auto long_overlay = fixture / "overlay";
+        const std::wstring first(105, L'a'), second(105, L'b');
+        const auto relative = std::filesystem::path(first) / second;
+        const auto package_dir = extended(long_package / relative);
+        const auto overlay_dir = extended(long_overlay / relative);
+        const auto leaf = L"pr\u00f8be.bin";
+        const std::wstring guest_dir = L"GAME:\\" + relative.native() + L"\\";
+        const std::wstring guest_file = guest_dir + leaf;
+        check((long_package / relative / leaf).native().size() > MAX_PATH,
+              "the fixture resolves to a host path beyond MAX_PATH");
+        write_path(package_dir / leaf, "package");
+        write_path(package_dir / "legacy.bin", "legacy");
+        std::filesystem::create_directories(package_dir / "empty");
+        check(read_path(package_dir / leaf) == "package", "native extended paths can provision the deep fixture");
+
+        rt::fs::configure(long_package, long_overlay);
+        const auto read_guest = [&](const std::wstring& name) {
+            const HANDLE h = create_w(name.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return std::string{};
+            auto bytes = read_handle(h);
+            ::CloseHandle(h);
+            return bytes;
+        };
+        check(read_guest(guest_file) == "package", "GAME: reads a deeply nested Unicode path from the package");
+        check(read_guest(guest_file + L". ") == "package",
+              "a long resolved name retains Win32 trailing-dot and trailing-space normalization");
+        check(attributes_w(guest_file.c_str()) != INVALID_FILE_ATTRIBUTES, "attributes resolve the same long path");
+        const std::string guest_ansi = "G:\\" + std::string(first.size(), 'a') + "\\" + std::string(second.size(), 'b') +
+                                       "\\legacy.bin";
+        HANDLE h = create_a(guest_ansi.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "legacy", "the G: alias opens a long path through CreateFileA");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
+        h = create_w(guest_file.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        DWORD written = 0;
+        check(h != INVALID_HANDLE_VALUE && ::WriteFile(h, "overlay", 7, &written, nullptr) && written == 7,
+              "the write-open copies up and writes a long path");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(read_guest(guest_file) == "overlay" && read_path(overlay_dir / leaf) == "overlay" &&
+                  read_path(package_dir / leaf) == "package",
+              "long paths prefer the overlay copy and keep the original package immutable");
+
+        const std::wstring copy = guest_dir + L"copy.bin", moved = guest_dir + L"moved.bin";
+        check(copy_w(guest_file.c_str(), copy.c_str(), TRUE) && move_w(copy.c_str(), moved.c_str()) &&
+                  read_guest(moved) == "overlay", "copy and move use the same long resolved overlay paths");
+        check(delete_w((guest_dir + L"legacy.bin").c_str()) && rmdir_w((guest_dir + L"empty").c_str()) &&
+                  read_path(package_dir / "legacy.bin") == "legacy",
+              "long file and directory deletions create markers and preserve the package");
+        const auto names = list(first_w, next_w, find_close, (guest_dir + L"*").c_str());
+        check(count(names, leaf) == 1 && contains(names, L"moved.bin") &&
+                  !contains(names, L"legacy.bin") && !contains(names, L"empty"),
+              "listing long paths merges both roots and honors file and directory markers");
+        check(attributes_w((guest_dir + L"legacy.bin").c_str()) == INVALID_FILE_ATTRIBUTES,
+              "a read-only query respects the long file's delete marker");
+
+        // Compare the same merged listing against the short-path Win32 search, including the names
+        // hidden by package deletion markers.
+        const wchar_t* const masks[] = {L"*.", L"?.", L"mesh*.", L"mesh*..", L"mesh?.", L"mesh.*.",
+                                        L"*.?.", L"*. ", L"*.*", L"mesh?.txt"};
+        const auto list_masks = [&](const std::filesystem::path& pack, const std::filesystem::path& layer,
+                                    const std::filesystem::path& subdir) {
+            for (const wchar_t* name : {L"a", L"a.txt", L"mesh", L"mesh1", L"mesh.txt", L"mesh-old", L".dot"})
+                write_path(extended(pack / subdir / name), "package");
+            for (const wchar_t* name : {L"mesh", L"mesh-cache", L"mesh-cache.tmp"})
+                write_path(extended(layer / subdir / name), "overlay");
+            rt::fs::configure(pack, layer);
+            const auto guest = L"GAME:\\" + subdir.native() + L"\\";
+            check(delete_w((guest + L"mesh-old").c_str()), "the wildcard fixture hides an extensionless package file");
+            std::vector<std::vector<std::wstring>> results;
+            for (const wchar_t* mask : masks) {
+                auto entries = list(first_w, next_w, find_close, (guest + mask).c_str());
+                std::sort(entries.begin(), entries.end());
+                results.push_back(std::move(entries));
+            }
+            return results;
+        };
+        const auto short_matches = list_masks(fixture / "short_package", fixture / "short_overlay", L"masks");
+        const auto long_matches = list_masks(long_package, long_overlay, relative / L"masks");
+        check(count(short_matches[0], L"mesh") == 1 && contains(short_matches[0], L"mesh-cache") &&
+                  !contains(short_matches[0], L"mesh.txt") && !contains(short_matches[0], L"mesh-old"),
+              "the short *. control merges extensionless entries and hides the deleted name");
+        for (size_t i = 0; i < short_matches.size(); ++i) {
+            char detail[96];
+            std::snprintf(detail, sizeof detail, "the long listing matches short Win32 for %ls", masks[i]);
+            check(long_matches[i] == short_matches[i], detail);
+        }
+
+        // The scratch drive is usable with a short guest name and a long configured overlay root.
+        const auto scratch_overlay = fixture / relative / "scratch_overlay";
+        rt::fs::configure(long_package, scratch_overlay);
+        h = create_a("T:\\scratch.bin", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+        written = 0;
+        check(h != INVALID_HANDLE_VALUE && ::WriteFile(h, "test", 4, &written, nullptr) && written == 4,
+              "T: creates and writes its scratch directory under a long overlay root");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(read_guest(L"T:\\scratch.bin") == "test" &&
+                  read_path(extended(scratch_overlay / ".gta6rt-temp" / "scratch.bin")) == "test",
+              "T: reads from the same long backing directory");
+        rt::fs::configure(package, overlay);
+
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(extended(fixture), cleanup_error);
+        check(!cleanup_error, "the synthetic long paths are removed after the test");
     }
 }
 

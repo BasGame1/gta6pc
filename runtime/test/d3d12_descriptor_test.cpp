@@ -333,6 +333,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.a8_render_target = d.a8_render_target;
         info.texture_compression_bc = d.bc;
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
@@ -344,7 +345,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
 
         D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{};
@@ -491,8 +492,10 @@ int main() {
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER) != 0);
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
-        EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
-                                     D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
+        // Render targets where the device has VK_FORMAT_A8_UNORM_KHR (they are then blendable too); never UAVs.
+        const bool a8_render_target = (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0;
+        EXPECT(a8_render_target == ((support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) != 0));
+        EXPECT(!(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) && !support.Support2);
         for (UINT count : {1u, 4u}) {
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality_levels{DXGI_FORMAT_A8_UNORM, count};
             EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality_levels,
@@ -504,10 +507,12 @@ int main() {
             auto desc = texture_desc;
             desc.Format = DXGI_FORMAT_A8_UNORM;
             desc.Flags = flag;
-            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                          __uuidof(ID3D12Resource), nullptr)));
-            EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
+            const bool allowed = flag == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && a8_render_target;
+            // With no output, a valid description is S_FALSE.
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             __uuidof(ID3D12Resource), nullptr)) == allowed);
+            EXPECT((device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX) == !allowed);
         }
         Ref<ID3D12Resource> byte_textures[2];
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};
@@ -526,6 +531,17 @@ int main() {
         }
         EXPECT(byte_placed[0].Offset == byte_placed[1].Offset &&
                byte_placed[0].Footprint.RowPitch == byte_placed[1].Footprint.RowPitch);
+        // An A8 render target (VK_FORMAT_A8_UNORM_KHR where the device has it) gets the same bytes, and its SRVs must
+        // read them as the R8-backed A8 texture's do. Without render-target support, slots 5 and 6 view that one.
+        Ref<ID3D12Resource> a8_target;
+        if (a8_render_target) {
+            auto desc = texture_desc;
+            desc.Format = DXGI_FORMAT_A8_UNORM;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(&a8_target.p))));
+        }
         for (UINT y = 0; y < size; ++y) {
             auto* row = static_cast<std::uint8_t*>(mapped) + byte_placed[0].Offset + y * byte_placed[0].Footprint.RowPitch;
             for (UINT x = 0; x < size; ++x) row[x] = std::uint8_t(1 + 3 * (y * size + x));
@@ -890,8 +906,11 @@ int main() {
         // Static samplers of a root signature (docs/d3d12_vulkan.md section 3.5): no heap slot and no root argument,
         // the shader holds the S# by value, so CreateRootSignature has to register it. One per blob version, each
         // the wrapping sampler above with its own LOD range (so its own key), and one that only the fourth has:
-        // a border sampler with the UINT white border of the static enum. None is in the hash table before its
-        // root signature is created, all are after. A version the PC serializer here does not write is skipped.
+        // a border sampler with the UINT white border of the static enum. The last is the integer border the enum has
+        // no value for: transparent black with D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR, which only a 1.2 blob can say
+        // and which D3D12 serializes and creates (the flag with the float OPAQUE_BLACK or OPAQUE_WHITE is the pair it
+        // refuses). None is in the hash table before its root signature is created, all are after. A version the PC
+        // serializer here does not write is skipped.
         const auto sampler_index = [&](const g::SamplerWords& words) {
             std::uint32_t key[8]{~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
             std::memcpy(key, words.data(), sizeof(words));
@@ -904,10 +923,13 @@ int main() {
             bool uint_white_border;
             g::SamplerWords words;
             bool created;
+            bool uint_transparent_border = false;  // the 1.2 flag on TRANSPARENT_BLACK
         } static_cases[] = {{D3D_ROOT_SIGNATURE_VERSION_1_0, "1.0", 6.0f, false, {}, false},
                             {D3D_ROOT_SIGNATURE_VERSION_1_1, "1.1", 7.0f, false, {}, false},
                             {D3D_ROOT_SIGNATURE_VERSION_1_2, "1.2", 8.0f, false, {}, false},
-                            {D3D_ROOT_SIGNATURE_VERSION_1_1, "1.1, UINT white border", 9.0f, true, {}, false}};
+                            {D3D_ROOT_SIGNATURE_VERSION_1_1, "1.1, UINT white border", 9.0f, true, {}, false},
+                            {D3D_ROOT_SIGNATURE_VERSION_1_2, "1.2, UINT transparent border", 10.0f, false, {}, false,
+                             true}};
         std::vector<Ref<ID3D12RootSignature>> static_roots(std::size(static_cases));
         UINT static_created = 0;
         for (std::size_t c = 0; c < std::size(static_cases); ++c) {
@@ -919,18 +941,25 @@ int main() {
                 expected.border_color = g::BorderColor::opaque_white;
                 expected.integer_border = true;
             }
+            if (test.uint_transparent_border) {
+                expected.address_u = g::AddressMode::clamp_border;
+                expected.border_color = g::BorderColor::transparent_black;
+                expected.integer_border = true;
+            }
             test.words = g::encode(expected);
             EXPECT(test.words != sampler_words && sampler_index(test.words) == 0);
 
             D3D12_STATIC_SAMPLER_DESC1 fixed{};
             fixed.Filter = sampler_desc.Filter;
-            fixed.AddressU = test.uint_white_border ? D3D12_TEXTURE_ADDRESS_MODE_BORDER : sampler_desc.AddressU;
+            fixed.AddressU = test.uint_white_border || test.uint_transparent_border ? D3D12_TEXTURE_ADDRESS_MODE_BORDER
+                                                                                    : sampler_desc.AddressU;
             fixed.AddressV = sampler_desc.AddressV;
             fixed.AddressW = sampler_desc.AddressW;
             fixed.MaxAnisotropy = sampler_desc.MaxAnisotropy;
             fixed.ComparisonFunc = sampler_desc.ComparisonFunc;
             fixed.BorderColor = test.uint_white_border ? D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT
                                                        : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+            if (test.uint_transparent_border) fixed.Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
             fixed.MaxLOD = test.max_lod;
             fixed.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             // D3D12_STATIC_SAMPLER_DESC is D3D12_STATIC_SAMPLER_DESC1 without the trailing Flags.
@@ -1181,7 +1210,7 @@ int main() {
                     }
         }
 
-        constexpr UINT a8_mip_slot = 4, byte_view_count = a8_mip_slot + 1;
+        constexpr UINT a8_mip_slot = 4, a8_target_slot = 5, byte_view_count = a8_target_slot + 2;
         D3D12_DESCRIPTOR_HEAP_DESC byte_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, byte_view_count,
                                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> byte_heap;
@@ -1211,6 +1240,18 @@ int main() {
         byte_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         byte_view.Texture2D.MostDetailedMip = 1;
         device->CreateShaderResourceView(byte_textures[0].p, &byte_view, byte_slot(a8_mip_slot));
+        {
+            // The A8 render target: a default view (null description) and the remapped one of slot 1.
+            ID3D12Resource* const a8_source = a8_target.p ? a8_target.p : byte_textures[0].p;
+            device->CreateShaderResourceView(a8_source, nullptr, byte_slot(a8_target_slot));
+            D3D12_SHADER_RESOURCE_VIEW_DESC remapped = byte_view;
+            remapped.Texture2D.MostDetailedMip = 0;
+            remapped.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3,
+                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1,
+                D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+            device->CreateShaderResourceView(a8_source, &remapped, byte_slot(a8_target_slot + 1));
+        }
 
         // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
         // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
@@ -1474,6 +1515,18 @@ int main() {
                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &ready);
         }
+        if (a8_target.p) {
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = a8_target.p;
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.pResource = upload.p;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint = byte_placed[0];
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            const auto ready = transition(a8_target.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &ready);
+        }
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
         // Upload, then the texture into a shader-resource state. Executing the list also brings set 0 up to date.
@@ -1677,10 +1730,30 @@ int main() {
 
             // The static samplers' S#s: the three wrapping ones give the texture, texel for texel, as the registered
             // literal does. Unregistered (CreateRootSignature dropping them) they would clamp like the second above.
+            // The two UINT border ones read the R8G8B8A8_UINT view one tile to the right, so every texel is their
+            // border: 1 in each channel for OPAQUE_WHITE_UINT, 0 for the 1.2 flag on TRANSPARENT_BLACK (alpha
+            // included). Unregistered, they too would clamp and read the texture's right edge.
             for (const StaticCase& test : static_cases) {
-                if (!test.created || test.uint_white_border) continue;
+                if (!test.created) continue;
                 SampleKeys key = keys[0];
                 std::memcpy(key.ssharp, test.words.data(), sizeof(key.ssharp));
+                if (test.uint_white_border || test.uint_transparent_border) {
+                    std::memcpy(key.tsharp, view_bytes(uint_slot), sizeof(key.tsharp));
+                    key.mode = 1;
+                    std::array<std::uint8_t, bytes> pixels{};
+                    EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
+                    const std::uint8_t want = test.uint_white_border ? 1 : 0;
+                    UINT border = 0;
+                    for (UINT i = 0; i < texels; ++i) {
+                        const std::uint8_t* p = pixels.data() + 4 * i;
+                        border += p[0] == want && p[1] == want && p[2] == want && p[3] == want;
+                    }
+                    std::printf("static sampler, root signature %s: %u/%u texels read the UINT border %u, "
+                                "first RGBA %u,%u,%u,%u\n",
+                                test.name, border, texels, unsigned(want), pixels[0], pixels[1], pixels[2], pixels[3]);
+                    EXPECT(border == texels);
+                    continue;
+                }
                 std::array<std::uint8_t, bytes> pixels{};
                 EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
                 UINT static_wrapped = 0, static_clamped = 0;
@@ -1943,12 +2016,17 @@ int main() {
                                                  {value, 0, 0, 255}, {255, value, 255, 0}};
             for (UINT k = 0; k < 4; ++k)
                 EXPECT(std::memcmp(byte_results.data() + k * bytes + 4 * i, expected[k], 4) == 0);
+            // The A8 render target's default and remapped views read as the A8 texture's (slots 0 and 1).
+            EXPECT(std::memcmp(byte_results.data() + a8_target_slot * bytes + 4 * i, expected[0], 4) == 0);
+            EXPECT(std::memcmp(byte_results.data() + (a8_target_slot + 1) * bytes + 4 * i, expected[1], 4) == 0);
             const UINT mip_texel = (i / size / 2) * mip_size + (i % size) / 2;
             const std::uint8_t mip_expected[] = {0, 0, 0, std::uint8_t(208 + mip_texel)};
             EXPECT(std::memcmp(byte_results.data() + a8_mip_slot * bytes + 4 * i, mip_expected, 4) == 0);
         }
         std::printf("A8 mip 1: %u samples matched across %u texels\n", texels, mip_size * mip_size);
         std::printf("A8 and R8 default and remapped views: %u texels matched each\n", texels);
+        std::printf("A8 render target (%s) default and remapped views: %u texels matched each\n",
+                    a8_target.p ? "VK_FORMAT_A8_UNORM_KHR" : "not supported: the R8-backed texture", texels);
 
         // A gather across the center of each 2x2 block uses the A8 view's R-to-A swizzle.
         // The remapped view of the same image forces alpha to zero.
@@ -2854,6 +2932,7 @@ int main() {
         typeless_heap.reset();
         uint_texture.reset();
         for (auto& resource : byte_textures) resource.reset();
+        a8_target.reset();
         byte_heap.reset();
         ms_texture.reset();
         ms_array.reset();

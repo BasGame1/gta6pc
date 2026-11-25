@@ -269,6 +269,37 @@ void test_legacy_entry_point() {
     Blobs blobs;
     HRESULT hr = D3D12SerializeRootSignature(&cleared, D3D_ROOT_SIGNATURE_VERSION_1_0, &blobs.blob, &blobs.error);
     check(SUCCEEDED(hr), "legacy copy with cleared flags is accepted by the PC serializer");
+
+    // The directly indexed bits meet a host that refuses them even at flags 0: the shim retries without them and
+    // puts them back in the blob. Reached through the registry, since the name above is the host import.
+    using LegacyFn = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**,
+                                      ID3DBlob**);
+    const auto legacy =
+        reinterpret_cast<LegacyFn>(rt::shims::find("d3d12_xs.dll", "D3D12SerializeRootSignature"));
+    check(legacy != nullptr, "the legacy shim is reachable");
+    D3D12_ROOT_SIGNATURE_DESC indexed = make_legacy_desc(rt::d3d12_xs::kDirectlyIndexedFlags);
+    Blobs retried;
+    hr = legacy ? legacy(&indexed, D3D_ROOT_SIGNATURE_VERSION_1_0, &retried.blob, &retried.error) : E_FAIL;
+    check(SUCCEEDED(hr) && retried.blob != nullptr, "legacy shim serializes with the directly indexed flags");
+    check(indexed.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(rt::d3d12_xs::kDirectlyIndexedFlags),
+          "legacy original keeps the directly indexed flags");
+    if (retried.blob) {
+        const uint8_t* bytes = static_cast<const uint8_t*>(retried.blob->GetBufferPointer());
+        const SIZE_T size = retried.blob->GetBufferSize();
+        uint32_t chunk_count = 0;
+        std::memcpy(&chunk_count, bytes + 28, sizeof(chunk_count));
+        bool kept = false;
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            uint32_t off = 0;
+            std::memcpy(&off, bytes + 32 + i * 4, sizeof(off));
+            if (off > size || size - off < 8 + 24) continue;
+            if (std::memcmp(bytes + off, "RTS0", 4) != 0) continue;
+            uint32_t flags = 0;
+            std::memcpy(&flags, bytes + off + 8 + 20, sizeof(flags));
+            kept = flags == rt::d3d12_xs::kDirectlyIndexedFlags;
+        }
+        check(kept, "the directly indexed flags are back in the legacy RTS0 chunk");
+    }
 }
 
 void test_preserves_low_bits_and_unknown_versions() {
@@ -479,6 +510,37 @@ void test_deserializer() {
     auto deserialize = reinterpret_cast<DeserializeFn>(
         rt::shims::find("d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer"));
     check(deserialize != nullptr, "shim registry exposes d3d12_xs!D3D12CreateRootSignatureDeserializer");
+    auto versioned = reinterpret_cast<decltype(&D3D12CreateVersionedRootSignatureDeserializer)>(
+        rt::shims::find("d3d12_xs.dll", "D3D12CreateVersionedRootSignatureDeserializer"));
+    check(versioned != nullptr, "shim registry exposes the versioned deserializer");
+    check(versioned && rt::shims::find("d3d12_xs.dll", "#7") == reinterpret_cast<void*>(versioned),
+          "ordinal 7 resolves to the versioned deserializer");
+    if (versioned) {
+        ID3D12VersionedRootSignatureDeserializer* de = nullptr;
+        auto bad_checksum = tampered;
+        bad_checksum[4] ^= 1;
+        HRESULT bad_hr = versioned(bad_checksum.data(), bad_checksum.size(), IID_PPV_ARGS(&de));
+        check(FAILED(bad_hr) && !de, "versioned shim rejects Xbox flags with corrupt checksum");
+        if (de) de->Release();
+        de = nullptr;
+        HRESULT versioned_hr = versioned(tampered.data(), tampered.size(), IID_PPV_ARGS(&de));
+        check(SUCCEEDED(versioned_hr) && de, "versioned shim accepts Xbox flags");
+        if (de) {
+            const auto* desc = de->GetUnconvertedRootSignatureDesc();
+            check(desc && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 && desc->Desc_1_0.Flags == 0,
+                  "versioned shim clears Xbox flags");
+            de->Release();
+        }
+        de = nullptr;
+        versioned_hr = versioned(bytes, size, IID_PPV_ARGS(&de));
+        check(SUCCEEDED(versioned_hr) && de, "versioned shim accepts clean blob");
+        if (de) de->Release();
+        const uint8_t garbage[] = {1, 2, 3, 4};
+        de = nullptr;
+        versioned_hr = versioned(garbage, sizeof(garbage), IID_PPV_ARGS(&de));
+        check(FAILED(versioned_hr), "versioned shim rejects garbage");
+        if (de) de->Release();
+    }
     if (!deserialize) return;
 
     ID3D12RootSignatureDeserializer* shim_de = nullptr;
@@ -488,6 +550,92 @@ void test_deserializer() {
         const D3D12_ROOT_SIGNATURE_DESC* d = shim_de->GetRootSignatureDesc();
         check(d->Flags == 0, "shim deserializer returns flags with the high byte cleared");
         shim_de->Release();
+    }
+
+    // Corrupted non-zero DXBC checksum: the helper must not forge a valid hash over a corrupted container.
+    {
+        std::vector<uint8_t> bad_hash = tampered;
+        bad_hash[4] ^= 0x01;
+        std::vector<uint8_t> out(1, 0xCC);
+        const bool rewrote = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(bad_hash.data(), bad_hash.size(), out);
+        check(!rewrote && out.empty(), "blob helper refuses to rewrite and re-sign a corrupted DXBC checksum");
+
+        ID3D12RootSignatureDeserializer* host_bad = nullptr;
+        const HRESULT hr_host =
+            D3D12CreateRootSignatureDeserializer(bad_hash.data(), bad_hash.size(), IID_PPV_ARGS(&host_bad));
+        if (host_bad) host_bad->Release();
+        if (FAILED(hr_host)) {
+            ID3D12RootSignatureDeserializer* shim_bad = nullptr;
+            const HRESULT hr_shim = deserialize(bad_hash.data(), bad_hash.size(), IID_PPV_ARGS(&shim_bad));
+            check(FAILED(hr_shim) && !shim_bad,
+                  "shim deserializer rejects a corrupted DXBC checksum just as the host does");
+            if (shim_bad) shim_bad->Release();
+        } else {
+            std::printf("SKIP host-vs-shim corrupted checksum rejection (this host accepts bad checksums)\n");
+        }
+    }
+
+    // Trailing bytes past DXBC total_size (bytes 24..27): host rejects and the helper must not rewrite/rehash it.
+    {
+        std::vector<uint8_t> trailing = tampered;
+        trailing.resize(trailing.size() + 16, 0xAB);
+        std::vector<uint8_t> out(1, 0xCC);
+        const bool rewrote = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(trailing.data(), trailing.size(), out);
+        check(!rewrote && out.empty(), "blob helper refuses a DXBC container with trailing bytes past total_size");
+
+        ID3D12RootSignatureDeserializer* host_trail = nullptr;
+        const HRESULT hr_host =
+            D3D12CreateRootSignatureDeserializer(trailing.data(), trailing.size(), IID_PPV_ARGS(&host_trail));
+        if (host_trail) host_trail->Release();
+        if (FAILED(hr_host)) {
+            ID3D12RootSignatureDeserializer* shim_trail = nullptr;
+            const HRESULT hr_shim = deserialize(trailing.data(), trailing.size(), IID_PPV_ARGS(&shim_trail));
+            check(FAILED(hr_shim) && !shim_trail,
+                  "shim deserializer rejects trailing bytes past total_size just as the host does");
+            if (shim_trail) shim_trail->Release();
+        } else {
+            std::printf("SKIP host-vs-shim trailing-bytes rejection (this host accepts trailing bytes)\n");
+        }
+    }
+
+    // Mismatched total_size header field (even if bytes 4..19 hold dxbc_checksum of the buffer length).
+    {
+        std::vector<uint8_t> bad_total = tampered;
+        uint32_t bogus_total = static_cast<uint32_t>(bad_total.size() + 4);
+        std::memcpy(bad_total.data() + 24, &bogus_total, sizeof(bogus_total));
+        uint32_t bad_total_hash[4];
+        rt::d3d12_xs::dxbc_checksum(bad_total.data(), bad_total.size(), bad_total_hash);
+        std::memcpy(bad_total.data() + 4, bad_total_hash, sizeof(bad_total_hash));
+        std::vector<uint8_t> out(1, 0xCC);
+        const bool rewrote = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(bad_total.data(), bad_total.size(), out);
+        check(!rewrote && out.empty(), "blob helper refuses a DXBC container whose header total_size != size");
+    }
+
+    // All-zero DXBC checksum: accepted by host d3d12.dll, so the helper clears the Xbox high byte and keeps it zeroed.
+    {
+        std::vector<uint8_t> zero_hash = tampered;
+        std::memset(zero_hash.data() + 4, 0, 16);
+        std::vector<uint8_t> out;
+        const bool rewrote = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(zero_hash.data(), zero_hash.size(), out);
+        constexpr uint8_t kZero[16] = {};
+        check(rewrote && out.size() == zero_hash.size() && std::memcmp(out.data() + 4, kZero, 16) == 0,
+              "blob helper rewrites an all-zero-checksum Xbox blob and keeps its zero checksum");
+
+        ID3D12RootSignatureDeserializer* shim_zero = nullptr;
+        const HRESULT hr_zero = deserialize(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&shim_zero));
+        check(SUCCEEDED(hr_zero) && shim_zero && shim_zero->GetRootSignatureDesc()->Flags == 0,
+              "shim deserializer accepts an all-zero-checksum Xbox blob with the high byte cleared");
+        if (shim_zero) shim_zero->Release();
+
+        if (versioned) {
+            ID3D12VersionedRootSignatureDeserializer* v_zero = nullptr;
+            const HRESULT v_hr_zero = versioned(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&v_zero));
+            const auto* desc = v_zero ? v_zero->GetUnconvertedRootSignatureDesc() : nullptr;
+            check(SUCCEEDED(v_hr_zero) && v_zero && desc &&
+                      desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 && desc->Desc_1_0.Flags == 0,
+                  "versioned shim accepts an all-zero-checksum Xbox blob with the high byte cleared");
+            if (v_zero) v_zero->Release();
+        }
     }
 }
 

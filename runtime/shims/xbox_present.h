@@ -100,7 +100,8 @@ class XboxPresentation {
 public:
     // `clock` null: real time (a steady high-resolution timer). Tests pass a leonida::ManualFrameClock, which must
     // outlive this object. `presenter` is what create_window_presenter returned.
-    explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr);
+    explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr,
+                              std::shared_ptr<leonida::FrameTokenSource> tokens = nullptr, bool current_origin_poll = false);
     ~XboxPresentation();
     XboxPresentation(const XboxPresentation&) = delete;
     XboxPresentation& operator=(const XboxPresentation&) = delete;
@@ -146,6 +147,8 @@ public:
     // for a present that was waiting for a swapchain image when SuspendX came.
     // `params` may be null (threshold 0). ImmediateThresholdPercent: see XboxPresentParameters; a frame that was shown
     // at once has its display statistic's percent_scanned set and is counted in immediate_presents().
+    // With --trace-d3d12 every call writes one `[d3d12-trace] ... XboxPresentation::PresentX <ok|failed>`
+    // line (shims/d3d12_trace.h), so a run's presents can be counted and a refused one is visible.
     HRESULT PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
     // SuspendX drops the interval, the origin event and the frames in flight, and refuses presents. ResumeX allows
     // presents again; SetFrameIntervalX and ScheduleFrameEventX must be called again before the next wait.
@@ -169,8 +172,13 @@ public:
     std::uint64_t presents() const { return presents_; }
     // Frames shown mid-scan because of ImmediateThresholdPercent.
     std::uint64_t immediate_presents() const { return pacer_.immediate_presents(); }
+    // Frame-time percentiles, mean drift against target interval, and origin-to-present latency (BL-6).
+    leonida::FramePacingSummary pacing_summary() const { return pacer_.pacing_summary(); }
+    void log_pacing_summary() const;
 
 private:
+    // PresentX without its `[d3d12-trace]` line.
+    HRESULT present_x(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
     float effective_sdr_white_nits();  // override, else the cached Windows setting while HDR10, else 203
     void display_white_worker();       // refreshes display_white_ off the present path
     std::unique_ptr<WindowPresenter> presenter_;
@@ -195,5 +203,15 @@ private:
 };
 
 inline constexpr UINT xbox_frame_event_origin = leonida::frame_event_origin;
+inline constexpr UINT xbox_frame_event_vblank = leonida::frame_event_vblank;
+inline constexpr UINT xbox_frame_event_flip = leonida::frame_event_flip;
+inline constexpr UINT xbox_frame_wait_token_on_timeout = leonida::frame_wait_flag_token_on_timeout;
+
+// Seam for the presenter, not yet called by the runtime: gta6rt creates no XboxPresentation, and only
+// d3d12_boot_movie_test and xbox_present_test construct one. Wires it into a d3d12_xs device proxy's frame-event
+// slots (78–81) and queue PresentX (slot 30, or LEONIDA_XS_PRESENT_X_SLOT); SuspendX and ResumeX are routed only
+// when LEONIDA_XS_SUSPEND_X_SLOT / LEONIDA_XS_RESUME_X_SLOT are set. Passing nullptr detaches the presentation.
+bool attach_xbox_presentation(void* device_proxy, XboxPresentation* presentation);
+bool detach_xbox_presentation(void* device_proxy);
 
 }  // namespace rt::d3d12

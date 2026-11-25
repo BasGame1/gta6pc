@@ -212,7 +212,8 @@ public:
         : parent_(parent),
           device_(device),
           context_(context),
-          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex()) {
+          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex(),
+                     context.device_fault()) {
         if (parent_) parent_->AddRef();
         if (device_) device_->AddRef();
     }
@@ -221,6 +222,7 @@ public:
         unregister_buffers();
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
+        swapchain_.close();
         if (device_) device_->Release();
         if (parent_) parent_->Release();
     }
@@ -228,6 +230,8 @@ public:
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {
         hwnd_ = hwnd;
         flags_ = desc.Flags;
+        swap_effect_ = desc.SwapEffect;
+        buffer_usage_ = desc.BufferUsage;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
@@ -303,6 +307,7 @@ public:
         if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
             (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
             return DXGI_ERROR_INVALID_CALL;
+        if (lost_) return DXGI_ERROR_INVALID_CALL;  // host-measured: no buffers after a failed ResizeBuffers
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
@@ -316,7 +321,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer, REFIID riid, void** surface) override {
-        if (!surface) return E_POINTER;
+        if (!surface) return DXGI_ERROR_INVALID_CALL;  // host-measured, not E_POINTER
         *surface = nullptr;
         if (buffer >= buffers_.size()) return DXGI_ERROR_INVALID_CALL;
         return buffers_[buffer]->QueryInterface(riid, surface);
@@ -332,17 +337,30 @@ public:
     HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
         std::memset(desc, 0, sizeof(*desc));
-        desc->BufferDesc.Width = swapchain_.extent().width;
-        desc->BufferDesc.Height = swapchain_.extent().height;
-        desc->BufferDesc.Format = vk_to_dxgi_format(swapchain_.format());
+        desc->BufferDesc.Width = lost_ ? lost_width_ : swapchain_.extent().width;
+        desc->BufferDesc.Height = lost_ ? lost_height_ : swapchain_.extent().height;
+        desc->BufferDesc.Format = current_format();
         desc->SampleDesc.Count = 1;
-        desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc->BufferCount = swapchain_.image_count();
+        desc->BufferUsage = buffer_usage_;
+        desc->BufferCount = lost_ ? lost_count_ : swapchain_.image_count();
         desc->OutputWindow = hwnd_;
         desc->Windowed = TRUE;
-        desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc->SwapEffect = swap_effect_;
         desc->Flags = flags_;
         return S_OK;
+    }
+
+    // The swap chain's format as GetDesc reports it.
+    DXGI_FORMAT current_format() const { return lost_ ? lost_format_ : vk_to_dxgi_format(swapchain_.format()); }
+
+    // A failed ResizeBuffers (see resize_buffers): no buffers until the next successful one, and the description
+    // reports what was asked for.
+    void lose_buffers(std::uint32_t width, std::uint32_t height, UINT count, DXGI_FORMAT format) {
+        lost_ = true;
+        lost_width_ = width;
+        lost_height_ = height;
+        lost_count_ = count;
+        lost_format_ = format;
     }
 
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags) override {
@@ -357,24 +375,52 @@ public:
             vk_fmt = dxgi_to_vk_format(fmt);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return E_INVALIDARG;
         }
+        // DXGI first checks creation-dependent flags against the chain's original flags. If one is missing, this
+        // E_INVALIDARG wins even when the same call also includes flags that independently return INVALID_CALL.
         constexpr UINT creation_only_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
-                                             DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+                                             DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING |
+                                             DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER | DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO |
+                                             0x2000u;
         if ((flags & creation_only_flags) != (flags_ & creation_only_flags)) return E_INVALIDARG;
+        // On a chain whose creation flags match, NONPREROTATED, FULLSCREEN_VIDEO and every bit from 0x4000 up are
+        // DXGI_ERROR_INVALID_CALL (host-measured on Windows 11 with the RTX 5070 Ti and WARP).
+        constexpr UINT refused_flags = ~0x3fffu | DXGI_SWAP_CHAIN_FLAG_NONPREROTATED |
+                                       DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO;
+        if (flags & refused_flags) return DXGI_ERROR_INVALID_CALL;
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
-        const std::size_t target_count = count ? count : buffers_.size();
+        const std::size_t target_count = count ? count : (lost_ ? lost_count_ : buffers_.size());
         if (node_masks && !std::all_of(node_masks, node_masks + target_count, [](UINT mask) { return mask <= 1; }))
             return DXGI_ERROR_INVALID_CALL;
         if (present_queues && !std::all_of(present_queues, present_queues + target_count, is_direct_present_queue))
             return DXGI_ERROR_INVALID_CALL;
         unregister_buffers();
-        const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
+        const VkExtent2D size = size_or_client(width, height, lost_ ? VkExtent2D{lost_width_, lost_height_}
+                                                                     : swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
         const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-        if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        // Host-measured (RTX 3060 Ti / NVIDIA 610.88 and WARP): once the arguments are accepted, the old buffers are
+        // gone. When the new ones can't be made, ResizeBuffers fails and the swap chain stays without buffers: its
+        // description already has the new size and count, GetBuffer and Present are DXGI_ERROR_INVALID_CALL, and the
+        // next successful ResizeBuffers brings it back. A side above 16384 is E_INVALIDARG on the hardware device
+        // (WARP takes 16385 and answers E_OUTOFMEMORY at 32768); a Vulkan failure here is E_OUTOFMEMORY.
+        // The size check also keeps vkCreateImage from an extent past the device's limits.
+        const DXGI_FORMAT next_format = fmt != DXGI_FORMAT_UNKNOWN ? fmt : current_format();
+        if (w > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || h > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+            lose_buffers(w, h, static_cast<UINT>(target_count), next_format);
+            return E_INVALIDARG;
+        }
+        // Format UNKNOWN keeps the swap chain's format, which after a failed ResizeBuffers is the one it asked for.
+        const VkFormat resize_format = vk_fmt != VK_FORMAT_UNDEFINED ? vk_fmt
+                                       : lost_ ? dxgi_to_vk_format(lost_format_) : VK_FORMAT_UNDEFINED;
+        if (!swapchain_.resize(w, h, resize_format, static_cast<std::uint32_t>(target_count), allow_tearing)) {
+            lose_buffers(w, h, static_cast<UINT>(target_count), next_format);
+            return E_OUTOFMEMORY;
+        }
+        lost_ = false;
         source_size_ = {w, h};  // host-measured: ResizeBuffers resets the source region to the new back buffers
         statistics_disjoint_.store(true, std::memory_order_relaxed);
         flags_ = next_flags;
@@ -442,7 +488,7 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* p) override {
-        if (!p) return E_INVALIDARG;
+        if (!p) return DXGI_ERROR_INVALID_CALL;  // host-measured
         *p = present_count_.load(std::memory_order_relaxed);
         return S_OK;
     }
@@ -451,14 +497,14 @@ public:
     HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* desc) override {
         if (!desc) return E_INVALIDARG;
         std::memset(desc, 0, sizeof(*desc));
-        desc->Width = swapchain_.extent().width;
-        desc->Height = swapchain_.extent().height;
-        desc->Format = vk_to_dxgi_format(swapchain_.format());
+        desc->Width = lost_ ? lost_width_ : swapchain_.extent().width;
+        desc->Height = lost_ ? lost_height_ : swapchain_.extent().height;
+        desc->Format = current_format();
         desc->SampleDesc.Count = 1;
-        desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc->BufferCount = swapchain_.image_count();
+        desc->BufferUsage = buffer_usage_;
+        desc->BufferCount = lost_ ? lost_count_ : swapchain_.image_count();
         desc->Scaling = DXGI_SCALING_STRETCH;
-        desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc->SwapEffect = swap_effect_;
         desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
         desc->Flags = flags_;
         return S_OK;
@@ -469,7 +515,11 @@ public:
         desc->Windowed = TRUE;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override {
+        if (!out) return DXGI_ERROR_INVALID_CALL;  // host-measured
+        *out = hwnd_;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void** out) override {
         if (!out) return DXGI_ERROR_INVALID_CALL;
         *out = nullptr;
@@ -479,15 +529,13 @@ public:
         return Present(sync, flags);
     }
     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
+    // Host-measured: a chain created without an output answers S_OK with a null output, and a null pointer is
+    // DXGI_ERROR_INVALID_CALL.
     HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** out) override {
-        if (!out) return E_INVALIDARG;
-        if (restrict_to_output_) {
-            *out = restrict_to_output_;
-            restrict_to_output_->AddRef();
-            return S_OK;
-        }
-        *out = nullptr;
-        return DXGI_ERROR_NOT_FOUND;
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        *out = restrict_to_output_;
+        if (restrict_to_output_) restrict_to_output_->AddRef();
+        return S_OK;
     }
     void set_restrict_to_output(IDXGIOutput* out) {
         if (restrict_to_output_) restrict_to_output_->Release();
@@ -517,8 +565,9 @@ public:
     // IDXGISwapChain2
     HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
         // Host-measured: a region larger than either back-buffer dimension is refused and keeps the stored one;
-        // zero is accepted. Present does not scale by it yet (documented difference).
-        const VkExtent2D extent = swapchain_.extent();
+        // zero is accepted. Present does not scale by it yet (documented difference). After a failed ResizeBuffers
+        // the host checks against the size that was asked for (16x16385 refuses 100x10, 16385x16 takes it).
+        const VkExtent2D extent = lost_ ? VkExtent2D{lost_width_, lost_height_} : swapchain_.extent();
         if (width > extent.width || height > extent.height) return DXGI_ERROR_INVALID_CALL;
         source_size_ = {width, height};
         return S_OK;
@@ -529,6 +578,10 @@ public:
         *h = source_size_.height;
         return S_OK;
     }
+    // Host-measured (Windows 11, RTX 5090 and WARP): the waitable object is a semaphore initialized to 1 with max 40.
+    // Increasing latency releases (max_latency - prev) tokens (if current + delta > 40, ReleaseSemaphore fails with
+    // ERROR_TOO_MANY_POSTS leaving count unchanged and SetMaximumFrameLatency still returns S_OK). Decreasing updates
+    // max_frame_latency_ without draining existing tokens. Present releases 1 token per non-test call up to max 40.
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
         if (!waitable_ || max_latency == 0 || max_latency > max_waitable_frame_latency)
             return DXGI_ERROR_INVALID_CALL;
@@ -538,16 +591,18 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* n) override {
-        if (!n) return E_INVALIDARG;
-        if (!waitable_) return DXGI_ERROR_INVALID_CALL;
+        // Host-measured (Windows 11, RTX 5090 and WARP): null output returns DXGI_ERROR_INVALID_CALL on both
+        // waitable and non-waitable swapchains.
+        if (!n || !waitable_) return DXGI_ERROR_INVALID_CALL;
         *n = max_frame_latency_.load(std::memory_order_relaxed);
         return S_OK;
     }
     HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override {
         if (!waitable_) return nullptr;
         HANDLE dup = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), waitable_, GetCurrentProcess(), &dup, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS))
+        // Host-measured (Windows 11, RTX 5090 and WARP): the returned handle grants SYNCHRONIZE only, so callers can
+        // wait on it and CloseHandle it, while ReleaseSemaphore fails with ERROR_ACCESS_DENIED.
+        if (!DuplicateHandle(GetCurrentProcess(), waitable_, GetCurrentProcess(), &dup, SYNCHRONIZE, FALSE, 0))
             return nullptr;
         return dup;
     }
@@ -618,8 +673,16 @@ private:
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
+    // As created: the host reports the creation SwapEffect and BufferUsage (FLIP_SEQUENTIAL, SHADER_INPUT, or 0).
+    DXGI_SWAP_EFFECT swap_effect_ = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    DXGI_USAGE buffer_usage_ = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
+    bool lost_ = false;  // after a failed ResizeBuffers: no buffers, the description below
+    std::uint32_t lost_width_ = 0;
+    std::uint32_t lost_height_ = 0;
+    UINT lost_count_ = 0;
+    DXGI_FORMAT lost_format_ = DXGI_FORMAT_UNKNOWN;
     std::atomic<UINT> present_count_{0};
     std::atomic<bool> statistics_disjoint_{true};
     std::atomic<LONGLONG> last_present_qpc_{0};
@@ -1048,7 +1111,7 @@ private:
 };
 
 
-// Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
+// Vulkan-backed IDXGIAdapter4 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
 
 // The adapter's user-mode driver version, as DXGI's CheckInterfaceSupport(IDXGIDevice) reports it: what
@@ -1082,7 +1145,7 @@ LARGE_INTEGER umd_driver_version(LUID luid) {
     return version;
 }
 
-class Adapter final : public IDXGIAdapter3 {
+class Adapter final : public IDXGIAdapter4 {
 public:
     Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
         : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
@@ -1109,8 +1172,9 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIAdapter) ||
-            riid == __uuidof(IDXGIAdapter1) || riid == __uuidof(IDXGIAdapter2) || riid == __uuidof(IDXGIAdapter3)) {
-            *out = static_cast<IDXGIAdapter3*>(this);
+            riid == __uuidof(IDXGIAdapter1) || riid == __uuidof(IDXGIAdapter2) || riid == __uuidof(IDXGIAdapter3) ||
+            riid == __uuidof(IDXGIAdapter4)) {
+            *out = static_cast<IDXGIAdapter4*>(this);
             AddRef();
             return S_OK;
         }
@@ -1254,6 +1318,26 @@ public:
         return S_OK;
     }
     void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD) override {}
+
+    // IDXGIAdapter4 (host DXGI answers it since Windows 10 1803). DXGI_ADAPTER_FLAG3_SOFTWARE is the same bit as
+    // DXGI_ADAPTER_FLAG_SOFTWARE; a null description is E_INVALIDARG, as on the host.
+    HRESULT STDMETHODCALLTYPE GetDesc3(DXGI_ADAPTER_DESC3* desc) override {
+        if (!desc) return E_INVALIDARG;
+        std::memset(desc, 0, sizeof(*desc));
+        std::memcpy(desc->Description, desc_.Description, sizeof(desc->Description));
+        desc->VendorId = desc_.VendorId;
+        desc->DeviceId = desc_.DeviceId;
+        desc->SubSysId = desc_.SubSysId;
+        desc->Revision = desc_.Revision;
+        desc->DedicatedVideoMemory = desc_.DedicatedVideoMemory;
+        desc->DedicatedSystemMemory = desc_.DedicatedSystemMemory;
+        desc->SharedSystemMemory = desc_.SharedSystemMemory;
+        desc->AdapterLuid = desc_.AdapterLuid;
+        desc->Flags = static_cast<DXGI_ADAPTER_FLAG3>(desc_.Flags);
+        desc->GraphicsPreemptionGranularity = desc_.GraphicsPreemptionGranularity;
+        desc->ComputePreemptionGranularity = desc_.ComputePreemptionGranularity;
+        return S_OK;
+    }
 
 private:
     void populate_desc() {

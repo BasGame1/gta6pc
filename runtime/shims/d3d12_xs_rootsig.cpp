@@ -1,6 +1,7 @@
 #include "d3d12_xs_rootsig.h"
 
 #include <cstring>
+#include <new>
 
 namespace rt::d3d12_xs {
 namespace {
@@ -42,6 +43,11 @@ void md5_block(uint32_t state[4], const uint32_t m[16]) {
 }  // namespace
 
 void dxbc_checksum(const uint8_t* blob, size_t size, uint32_t out[4]) {
+    if (!out) return;
+    if (!blob || size < 20 || size - 20 > 0x1FFFFFFFu) {
+        std::memset(out, 0, 16);
+        return;
+    }
     // MD5 with the DXBC tail: the bit count goes first in the last block and (bits >> 2) | 1 last, in place of
     // MD5's 64-bit length (the d3dcompiler container hash; vkd3d-shader and Wine use the same).
     const uint8_t* data = blob + 20;
@@ -124,42 +130,238 @@ void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& 
     out.Flags = clear_high_byte(in.Flags);
 }
 
-bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<uint8_t>& out) {
-    out.clear();
-    if (!data || size < 36) return false;
+namespace {
 
-    const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    // The host deserializer only consumes the DXBC container the serializer
-    // produces, so a non-DXBC blob is forwarded unchanged (no rewrite).
+// Offset of the RTS0 chunk in a DXBC container, after checking the container hash and every chunk-table entry.
+// A blob whose hash does not match is refused (fail closed, so a corrupted blob reaches the host unchanged);
+// an all-zero hash is accepted and reported in `zero_hash` so a rewrite keeps it zeroed, as the host does.
+bool find_rts0(const uint8_t* bytes, size_t size, uint32_t& rts0_off, bool& zero_hash) {
+    if (!bytes || size < 36 || size - 20 > 0x1FFFFFFFu) return false;
+    // The host deserializer only consumes the DXBC container the serializer produces, so a non-DXBC blob is
+    // forwarded unchanged (no rewrite).
     if (std::memcmp(bytes, "DXBC", 4) != 0) return false;
+
+    uint32_t total_size = 0;
+    std::memcpy(&total_size, bytes + 24, sizeof(total_size));
+    if (total_size != size) return false;
 
     uint32_t chunk_count = 0;
     std::memcpy(&chunk_count, bytes + 28, sizeof(chunk_count));
-    if (chunk_count == 0 || chunk_count > 16 || 32 + chunk_count * 4 > size) return false;
+    if (chunk_count == 0 || chunk_count > 16 || static_cast<size_t>(chunk_count) * 4 > size - 32) return false;
 
+    constexpr uint8_t kZeroHash[16] = {};
+    zero_hash = std::memcmp(bytes + 4, kZeroHash, sizeof(kZeroHash)) == 0;
+    if (!zero_hash) {
+        uint32_t expected_hash[4];
+        dxbc_checksum(bytes, size, expected_hash);
+        if (std::memcmp(expected_hash, bytes + 4, sizeof(expected_hash)) != 0) return false;
+    }
+
+    // Fail closed on any malformed chunk-table entry (5c3487a94).
+    const size_t min_chunk_off = 32 + static_cast<size_t>(chunk_count) * 4;
+    bool found = false;
     for (uint32_t i = 0; i < chunk_count; ++i) {
         uint32_t off = 0;
-        std::memcpy(&off, bytes + 32 + i * 4, sizeof(off));
-        // Chunk header (FourCC + size) plus the fixed RTS0 header up to flags.
-        if (off > size || size - off < 8 + 24) continue;
-        if (std::memcmp(bytes + off, "RTS0", 4) != 0) continue;
+        std::memcpy(&off, bytes + 32 + static_cast<size_t>(i) * 4, sizeof(off));
+        if (off < min_chunk_off || off > size || size - off < 8) return false;
+        uint32_t chunk_size = 0;
+        std::memcpy(&chunk_size, bytes + off + 4, sizeof(chunk_size));
+        if (chunk_size > size - off - 8) return false;
+        if (!found && std::memcmp(bytes + off, "RTS0", 4) == 0) {
+            if (chunk_size < 24) return false;
+            found = true;
+            rts0_off = off;
+        }
+    }
+    return found;
+}
 
-        const uint8_t* payload = bytes + off + 8;
-        uint32_t flags = 0;
-        std::memcpy(&flags, payload + 20, sizeof(flags));
-        const uint32_t cleared = static_cast<uint32_t>(clear_high_byte(
-            static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags)));
-        if (cleared == flags) return false;  // no Xbox high byte
+// Rewrite the RTS0 flags dword of `blob` to `flags`, re-signing the container when it carried a hash. Used to put
+// back the bits the host serializer refused; unlike copy_rts0_blob_clear_xbox_flags it does not require them to
+// differ from what the blob already has.
+bool rewrite_rts0_flags(const void* data, size_t size, uint32_t flags, std::vector<uint8_t>& out) {
+    out.clear();
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    uint32_t rts0_off = 0;
+    bool zero_hash = false;
+    if (!find_rts0(bytes, size, rts0_off, zero_hash)) return false;
 
-        out.assign(bytes, bytes + size);
-        std::memcpy(out.data() + off + 8 + 20, &cleared, sizeof(cleared));
-        // The host deserializer checks the container hash (bytes 4..19), so a stale one is E_INVALIDARG.
+    out.assign(bytes, bytes + size);
+    std::memcpy(out.data() + rts0_off + 8 + 20, &flags, sizeof(flags));
+    if (!zero_hash) {
         uint32_t hash[4];
         dxbc_checksum(out.data(), out.size(), hash);
         std::memcpy(out.data() + 4, hash, sizeof(hash));
-        return true;
     }
-    return false;
+    return true;
+}
+
+}  // namespace
+
+bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!data) return false;
+
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    uint32_t rts0_off = 0;
+    bool zero_hash = false;
+    if (!find_rts0(bytes, size, rts0_off, zero_hash)) return false;
+
+    const uint8_t* payload = bytes + rts0_off + 8;
+    uint32_t rts_version = 0;
+    std::memcpy(&rts_version, payload, sizeof(rts_version));
+    if (rts_version < 1 || rts_version > 3) return false;
+
+    uint32_t flags = 0;
+    std::memcpy(&flags, payload + 20, sizeof(flags));
+    const uint32_t cleared = static_cast<uint32_t>(clear_high_byte(
+        static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags)));
+    if (cleared == flags) return false;  // no Xbox high byte
+
+    out.assign(bytes, bytes + size);
+    std::memcpy(out.data() + rts0_off + 8 + 20, &cleared, sizeof(cleared));
+    // The host deserializer checks the container hash (bytes 4..19), so a stale one is E_INVALIDARG; an all-zero
+    // checksum is not checked and is kept.
+    if (!zero_hash) {
+        uint32_t hash[4];
+        dxbc_checksum(out.data(), out.size(), hash);
+        std::memcpy(out.data() + 4, hash, sizeof(hash));
+    }
+    return true;
+}
+
+namespace {
+
+class RewrittenBlob final : public ID3DBlob {
+public:
+    explicit RewrittenBlob(std::vector<uint8_t> bytes) : bytes_(std::move(bytes)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D10Blob)) {
+            AddRef();
+            *out = static_cast<ID3DBlob*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (!left) delete this;
+        return left;
+    }
+    LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return bytes_.data(); }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return bytes_.size(); }
+
+private:
+    std::vector<uint8_t> bytes_;
+    ULONG refs_ = 1;
+};
+
+HRESULT make_blob(std::vector<uint8_t> bytes, ID3DBlob** out) {
+    if (!out) return E_POINTER;
+    *out = new (std::nothrow) RewrittenBlob(std::move(bytes));
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+
+// Hands `blob` and `error` to the caller, releasing a blob it did not ask for.
+void give(ID3DBlob** slot, ID3DBlob* blob) {
+    if (slot)
+        *slot = blob;
+    else if (blob)
+        blob->Release();
+}
+
+// Shared retry: `first` is the failed attempt on `flags`, `error` the host's error blob. Calls `fn` again without
+// the directly-indexed bits, then restores them. `call` is `fn(&stripped, &plain, &plain_error)`'s result.
+HRESULT finish_retry(bool retried, HRESULT hr, uint32_t flags, ID3DBlob* first, ID3DBlob* first_error,
+                     ID3DBlob* plain, ID3DBlob* plain_error, ID3DBlob** blob, ID3DBlob** error) {
+    if (!retried) {
+        give(blob, first);
+        give(error, first_error);
+        return hr;
+    }
+    if (first) first->Release();
+    if (first_error) first_error->Release();
+    if (FAILED(hr) || !plain) {
+        give(blob, plain);
+        give(error, plain_error);
+        return FAILED(hr) ? hr : S_FALSE;
+    }
+    std::vector<uint8_t> patched;
+    if (!rewrite_rts0_flags(plain->GetBufferPointer(), plain->GetBufferSize(), flags, patched)) {
+        give(blob, plain);
+        give(error, plain_error);
+        return S_FALSE;  // a usable blob, but the flags are lost
+    }
+    ID3DBlob* rewritten = nullptr;
+    const HRESULT made = make_blob(std::move(patched), &rewritten);
+    plain->Release();
+    if (FAILED(made)) {
+        give(blob, nullptr);
+        give(error, plain_error);
+        return made;
+    }
+    give(blob, rewritten);
+    give(error, plain_error);
+    return S_OK;
+}
+
+}  // namespace
+
+HRESULT serialize_versioned_keeping_heap_flags(VersionedSerializeFn fn, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc,
+                                               ID3DBlob** blob, ID3DBlob** error) {
+    if (!fn) return E_NOTIMPL;
+    uint32_t flags = 0;
+    switch (desc.Version) {
+    case D3D_ROOT_SIGNATURE_VERSION_1_0: flags = static_cast<uint32_t>(desc.Desc_1_0.Flags); break;
+    case D3D_ROOT_SIGNATURE_VERSION_1_1: flags = static_cast<uint32_t>(desc.Desc_1_1.Flags); break;
+    case D3D_ROOT_SIGNATURE_VERSION_1_2: flags = static_cast<uint32_t>(desc.Desc_1_2.Flags); break;
+    default: break;
+    }
+
+    ID3DBlob* first = nullptr;
+    ID3DBlob* first_error = nullptr;
+    const HRESULT hr = fn(&desc, &first, &first_error);
+    const bool retry = FAILED(hr) && (flags & kDirectlyIndexedFlags) != 0;
+    if (!retry) return finish_retry(false, hr, flags, first, first_error, nullptr, nullptr, blob, error);
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC stripped = desc;
+    const uint32_t kept = flags & ~kDirectlyIndexedFlags;
+    switch (stripped.Version) {
+    case D3D_ROOT_SIGNATURE_VERSION_1_0:
+        stripped.Desc_1_0.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kept);
+        break;
+    case D3D_ROOT_SIGNATURE_VERSION_1_1:
+        stripped.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kept);
+        break;
+    default:
+        stripped.Desc_1_2.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kept);
+        break;
+    }
+    ID3DBlob* plain = nullptr;
+    ID3DBlob* plain_error = nullptr;
+    const HRESULT again = fn(&stripped, &plain, &plain_error);
+    return finish_retry(true, again, flags, first, first_error, plain, plain_error, blob, error);
+}
+
+HRESULT serialize_legacy_keeping_heap_flags(LegacySerializeFn fn, const D3D12_ROOT_SIGNATURE_DESC& desc,
+                                            D3D_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob, ID3DBlob** error) {
+    if (!fn) return E_NOTIMPL;
+    const uint32_t flags = static_cast<uint32_t>(desc.Flags);
+    ID3DBlob* first = nullptr;
+    ID3DBlob* first_error = nullptr;
+    const HRESULT hr = fn(&desc, version, &first, &first_error);
+    const bool retry = FAILED(hr) && (flags & kDirectlyIndexedFlags) != 0;
+    if (!retry) return finish_retry(false, hr, flags, first, first_error, nullptr, nullptr, blob, error);
+
+    D3D12_ROOT_SIGNATURE_DESC stripped = desc;
+    stripped.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags & ~kDirectlyIndexedFlags);
+    ID3DBlob* plain = nullptr;
+    ID3DBlob* plain_error = nullptr;
+    const HRESULT again = fn(&stripped, version, &plain, &plain_error);
+    return finish_retry(true, again, flags, first, first_error, plain, plain_error, blob, error);
 }
 
 }  // namespace rt::d3d12_xs
