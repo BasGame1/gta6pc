@@ -274,6 +274,51 @@ int main(int argc, char** argv) {
         src_buf = saved_src;
     }
 
+    // A +4 host prefix is legal for buffer transfers but not an 8-byte RGBA16 texel.
+    // Stage both directions, preserving each footprint's row padding and the host prefix.
+    {
+        const auto saved_src = src_buf, saved_dst = dst_buf, saved_image = rgba_img;
+        src_buf.buffer_offset = dst_buf.buffer_offset = 4;
+        src_buf.size = dst_buf.size = 512;
+        rgba_img.format = VK_FORMAT_R16G16B16A16_UNORM;
+        rgba_img.width = 1;
+        rgba_img.height = 2;
+        vk.copy_scratch = [](VkDeviceSize bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+            expect(bytes == 16, "scratch contains only two occupied texels");
+            buffer = handle<VkBuffer>(0x8000);
+            offset = 64;
+            return true;
+        };
+        const CopyLocation tex{3, false, 0, 0, 0, 0, 0, 0};
+        const CopyLocation source{1, true, 0, 0, 1, 2, 1, 256};
+        const CopyLocation target{2, true, 0, 0, 1, 2, 1, 256};
+        CommandList up, down;
+        expect(up.copy_texture({tex, 0, 0, 0, source, false, {}}) && up.close(), "record +4 RGBA16 upload");
+        expect(down.copy_texture({target, 0, 0, 0, tex, false, {}}) && down.close(), "record +4 RGBA16 readback");
+        expect(run(up) == ReplayResult::success, "+4 RGBA16 upload stages");
+        expect(buffer_copies.size() == 2 && buffer_copies[0].srcOffset == 4 &&
+                   buffer_copies[1].srcOffset == 260 && buffer_copies[0].dstOffset == 64 &&
+                   buffer_copies[1].dstOffset == 72 && buffer_copies[0].size == 8 && buffer_copies[1].size == 8,
+               "upload stages only texels, excluding prefix and row padding");
+        expect(b2i_copies.size() == 1 && b2i_copies[0].bufferOffset == 64 &&
+                   b2i_copies[0].bufferRowLength == 0, "image upload uses aligned packed scratch");
+        expect(run(down) == ReplayResult::success, "+4 RGBA16 readback stages");
+        expect(buffer_copies.size() == 2 && buffer_copies[0].dstOffset == 4 &&
+                   buffer_copies[1].dstOffset == 260 && buffer_copies[0].srcOffset == 64 &&
+                   buffer_copies[1].srcOffset == 72 && buffer_copies[0].size == 8 && buffer_copies[1].size == 8,
+               "readback leaves host prefix, padding and tail untouched");
+        expect(i2b_copies.size() == 1 && i2b_copies[0].bufferOffset == 64,
+               "image readback uses aligned scratch");
+        vk.copy_scratch = {};
+        expect(run(up) == ReplayResult::unsupported, "unaligned import fails safely without scratch");
+        rgba_img.format = VK_FORMAT_R8_UNORM;
+        src_buf.buffer_offset = 1;
+        expect(run(up) == ReplayResult::success, "byte-aligned R8 import retains the direct path");
+        src_buf = saved_src;
+        dst_buf = saved_dst;
+        rgba_img = saved_image;
+    }
+
     // 4. CopyTexture on depth24_as_float passes buffer_offset + offset and buffer_offset + size to Depth24Converter.
     {
         const auto saved_src = src_buf, saved_dst = dst_buf;

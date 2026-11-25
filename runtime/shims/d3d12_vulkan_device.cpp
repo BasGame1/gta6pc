@@ -5773,14 +5773,13 @@ public:
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
+        if (start & 3) return E_NOTIMPL;  // byte-unaligned copies keep the ordinary-buffer fallback
+        if (!address || !desc_.Width || alignment > UINT64_MAX / 2 ||
+            (alignment & (alignment - 1)) || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
-        // Apply the same backing size rule to imports. The committed-range check and Vulkan bind requirements
-        // below cover the padding as well. The import never initializes or writes the caller's padding.
+        // Keep the device-address word padding, and include the host page prefix in the backing buffer.
         const VkDeviceSize backing_size = need_bda ? align_up(desc_.Width, sizeof(std::uint32_t)) : desc_.Width;
-        // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
-        // title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned address on an RTX 5090,
-        // found in review), which an import of `address` itself would refuse.
+        // Bind at zero; replay and device addresses carry the logical buffer's prefix instead.
         const std::uintptr_t base = start & ~static_cast<std::uintptr_t>(alignment - 1);
         void* const base_address = reinterpret_cast<void*>(base);
         const VkDeviceSize offset = start - base;
@@ -5824,7 +5823,7 @@ public:
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-        info.size = backing_size;
+        info.size = offset + backing_size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -5858,9 +5857,8 @@ public:
                                                 &host) != VK_SUCCESS)
             return decline(E_NOTIMPL);
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
-        // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || requirements.size > bytes - offset)
-            return decline(E_NOTIMPL);
+        // The binding is at zero; requirements cover the prefix as part of the buffer.
+        if (!types || requirements.size > bytes) return decline(E_NOTIMPL);
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
@@ -5892,12 +5890,12 @@ public:
             if (memory_) break;
         }
         if (!memory_) return decline(E_OUTOFMEMORY);
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS)
-            return decline(E_OUTOFMEMORY);
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return decline(E_OUTOFMEMORY);
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             bda.buffer = buffer_;
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            if (buffer_va_) buffer_va_ += offset;
             gpu_va_ = buffer_va_;
         }
         // An import the driver put below the arena cannot be named by a V#: the V# keeps 48 bits of (device address
@@ -5936,6 +5934,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+        binding.buffer_offset = offset;
         binding.size = desc_.Width;
         binding.host = static_cast<const std::uint8_t*>(address);
         binding.host_readable = true;
