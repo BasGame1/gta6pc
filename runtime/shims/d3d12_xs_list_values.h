@@ -608,9 +608,10 @@ private:
         bump(counters().release_stalls);
         static std::atomic<unsigned> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
-            std::fprintf(stderr, "[rt] d3d12_xs: the releaser (thread %lu) has been inside one gate Signal (value "
+            std::fprintf(stderr, "[rt] d3d12_xs: the releaser (thread %lu) has been inside one %s (value "
                                  "%llu) for %llu ms: the work the layer held behind the gate has not run\n",
                          releaser_tid_.load(std::memory_order_relaxed),
+                         signal_stage_.load(std::memory_order_relaxed),
                          static_cast<unsigned long long>(signal_value_.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(ms));
     }
@@ -633,7 +634,8 @@ private:
             for (Release& release : batch) {
                 if (stop_.load(std::memory_order_relaxed)) break;
                 signal_value_.store(release.value, std::memory_order_relaxed);
-                signal_since_ms_.store(GetTickCount64() | 1, std::memory_order_relaxed);  // never 0 while inside
+                const std::uint64_t now = GetTickCount64();
+                signal_since_ms_.store(now ? now : 1, std::memory_order_relaxed);  // never 0 without rounding up past now
                 signal(release);
                 signal_since_ms_.store(0, std::memory_order_relaxed);
             }
@@ -643,9 +645,13 @@ private:
     }
 
     // The action (if any), then the gate's Signal, which runs whatever the layer held behind it.
-    static void signal(const Release& release) {
+    void signal(const Release& release) {
         const auto started = Clock::now();
-        if (release.action) release.action();
+        if (release.action) {
+            signal_stage_.store("action", std::memory_order_relaxed);
+            release.action();
+        }
+        signal_stage_.store("gate Signal", std::memory_order_relaxed);
         release.queue->gate->Signal(release.value);
         const auto us = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
@@ -1041,6 +1047,7 @@ private:
     bool releasing_ = false;
     std::atomic<std::uint64_t> signal_since_ms_{0};  // GetTickCount64 when the releaser's current Signal began, or 0
     std::atomic<std::uint64_t> signal_value_{0};
+    std::atomic<const char*> signal_stage_{"gate Signal"};
     std::atomic<DWORD> releaser_tid_{0};
     bool stall_logged_ = false;  // the pump thread's only
     std::mutex settle_mutex_;          // the caller's-thread settling without threads (start_or_settle)

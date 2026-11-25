@@ -1873,8 +1873,21 @@ public:
             wait.semaphoreCount = std::uint32_t(semaphores.size());
             wait.pSemaphores = semaphores.data();
             wait.pValues = values.data();
-            // Outside submit_mutex_: a signal may need it.
-            observe_result(vk.vkWaitSemaphores(device_, &wait, UINT64_MAX), "vkWaitSemaphores (retirement)");
+            // Outside submit_mutex_: a signal may need it. Poll in 2 s slices so a wedged queue leaves a log line.
+            bool logged_stall = false;
+            for (;;) {
+                const VkResult res = vk.vkWaitSemaphores(device_, &wait, 2'000'000'000ULL);
+                if (res != VK_TIMEOUT) {
+                    observe_result(res, "vkWaitSemaphores (retirement)");
+                    break;
+                }
+                if (!logged_stall) {
+                    logged_stall = true;
+                    std::fprintf(stderr, "[rt] vulkan: wait_retire_ticket(%llu) waiting >2s on %zu queue(s)\n",
+                                 static_cast<unsigned long long>(ticket), semaphores.size());
+                }
+                if (is_device_lost()) return 0;
+            }
         }
         return completed_retire_ticket();
     }
@@ -3858,6 +3871,8 @@ private:
     // A timeout only means the GPU is slow: wait again rather than allocate past the cap. False when the device is lost
     // (now or while waiting), so the caller submits nothing.
     bool wait_for_room() {
+        auto stalled_at = std::chrono::steady_clock::time_point{};
+        bool logged_stall = false;
         for (;;) {
             if (context_.is_device_lost()) return false;
             if (buffers_.size() < kMaxQueuedCommandBuffers) return true;
@@ -3868,6 +3883,15 @@ private:
             case VK_SUCCESS:
                 return true;
             case VK_TIMEOUT:
+                if (stalled_at == std::chrono::steady_clock::time_point{}) {
+                    stalled_at = std::chrono::steady_clock::now();
+                } else if (!logged_stall &&
+                           std::chrono::steady_clock::now() - stalled_at >= std::chrono::seconds(2)) {
+                    logged_stall = true;
+                    std::fprintf(stderr, "[rt] vulkan: wait_for_room stuck >2s on queue kind=%d (done=%llu, submitted=%llu, queued=%zu)\n",
+                                 int(kind_), static_cast<unsigned long long>(done),
+                                 static_cast<unsigned long long>(submitted_), buffers_.size());
+                }
                 continue;
             case VK_ERROR_DEVICE_LOST:
                 context_.mark_device_lost();

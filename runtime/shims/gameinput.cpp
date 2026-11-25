@@ -545,6 +545,8 @@ public:
     TriggerWaveform waveforms[kHapticMotors]{};
     GameInputBatteryState battery{0, 0, 0, 0, GameInputBatteryUnknown};
     AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
+    SDL_GUID guid{};             // raw SDL GUID: physical reconnect fallback when path changes and serial is empty
+    bool is_virtual = false;     // true for the synthetic keyboard pad, never matched as a physical reconnect
 
     // Poll-thread state.
     SDL_Gamepad* pad = nullptr;
@@ -1365,6 +1367,21 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
         ++twins;
         if (!d && old->status == GameInputDeviceNoStatus) d = old;
     }
+    const bool virtual_pad = is_keyboard_pad(jid);
+    // When an XInput/HID pad has no serial and Wine/OS assigns a different path on replug, reuse the
+    // disconnected physical device with the same SDL GUID so handles and AppLocalDeviceId remain valid.
+    if (!d && !(serial && *serial) && !virtual_pad) {
+        for (Device* old : s.devices) {
+            if (old->status != GameInputDeviceNoStatus || old->is_virtual ||
+                old->info.deviceFamily == GameInputFamilyAggregate)
+                continue;
+            if (std::memcmp(old->guid.data, guid.data, sizeof guid.data) == 0) {
+                d = old;
+                d->base_id = base;
+                break;
+            }
+        }
+    }
     AppLocalDeviceId id = d ? d->info.deviceId : base;  // a copy: fill_info clears info before it writes the id
     if (!d) {
         const auto taken = [&s](const AppLocalDeviceId& v) {
@@ -1376,6 +1393,8 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
         for (uint32_t n = twins + 1; taken(id); ++n) id_bytes(identity, guid, n, &id);
         d = new Device;
         d->base_id = base;
+        d->guid = guid;
+        d->is_virtual = virtual_pad;
         s.devices.push_back(d);
     }
     d->pad = p;
