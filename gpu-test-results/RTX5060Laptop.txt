@@ -1,0 +1,28 @@
+GPU:        NVIDIA GeForce RTX 5060 Laptop GPU (Blackwell, PCI 10de:2d19)
+Driver:     NVIDIA 620.70.06 (proprietary), Vulkan 1.4.357
+Subgroup:   32..32 (default 32, subgroupSizeControl)
+OS:         CachyOS, kernel 7.3.4-1-cachyos
+Commit:     389cd645984c1500c767b3f2d4bb93aad0513a3b
+Tools:      llvm-mc 23.1.5, SPIRV-Tools v2026.4, CMake 4.4.4, GCC 16.2.1, Python 3.14.10
+CPU:        Intel(R) Core(TM) Ultra 7 255H
+
+run_gpu_tests.py:
+            274/274 shaders translated and pass spirv-val in both modes.
+            Native: 208/264 passed, 55 skipped, 1 failed.
+            LEONIDA_W64_EMULATE=1: 242/264 passed, 21 skipped, 1 failed.
+
+Failed:     cs_imgatomic_ext (both modes):
+            6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101.
+
+Skipped:    Native: 55 skipped.
+            Emulated: 21 skipped.
+
+Runtime:    Linux host build (-DLEONIDA_VULKAN_HEADERS_FETCH=ON).
+            ctest: 96/96 listed (94 passed, 2 skipped: shader_library_corpus, vk_sync_validation; 0 failed).
+
+Notes:
+- ms_wave_info_s3: 4096/4096 pixels exact in both modes.
+- cs_signed_zero_nan: PASS in both modes.
+- Test run performed on 2026-11-25.
+- AI-assisted test automation and report preparation.
+- Synthetic tests only; no game files used.
