@@ -4343,8 +4343,11 @@ Not implemented yet:
   vertices or indices, 2^26 vertex instances (count times instances), 65 535 groups per dimension, 2^20 groups per
   dispatch and a 2^27-unit work budget per call that saturates through an atomic compare-and-swap - and writes an
   empty record past `min(count, max_command_count)` and past the budget, and the clamped count word a `*Count` draw
-  then reads (so the count is at most `maxDrawCount`, VUID-vkCmdDrawIndirectCount-countBuffer-02717). The indirect
-  command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
+  then reads (so the count is at most `maxDrawCount`, VUID-vkCmdDrawIndirectCount-countBuffer-02717). A draw record
+  of 2^23 vertices or indices an instance or more is a slot the title has not filled: it runs empty and charges
+  nothing (RT-INDIRECT-DRAW-UNFILLED-COUNT). Before, each was cut to 2^24 and charged that, so eight of them used up
+  the budget and every later draw in the list ran empty; a census in a VIctory fork found 90 such records in one
+  list. The indirect command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
   memory barrier with a transfer access are not allowed inside a dynamic-rendering scope. The records are
   bit-identical to the application's when they are within the limits, the argument and count buffers are left
   untouched, and the scratch comes from a per-submission pool (`vulkan_scratch.h`) that a list with many indirect
