@@ -32,6 +32,7 @@
 // GameInput.dll ordinal #1 is GameInputCreate (measured in the executable); both name and ordinal #1 are registered,
 // along with xgameruntime.dll!GameInputCreate.
 #include <windows.h>
+#include <dbt.h>
 
 #include <SDL3/SDL.h>
 
@@ -1965,6 +1966,26 @@ bool init_sdl() {
     return true;
 }
 
+// Wine often omits WM_DEVICECHANGE / CM_Register_Notification after USB or Bluetooth replug, leaving SDL3's
+// HIDAPI and Windows joystick detectors sleeping forever when HWND_MESSAGE succeeded. Nudge SDL's message-only
+// detector windows so the next SDL_UpdateGamepads() rescans.
+void nudge_sdl_hotplug() {
+    const DWORD self_pid = GetCurrentProcessId();
+    DEV_BROADCAST_DEVICEINTERFACE_W dbcc{};
+    dbcc.dbcc_size = sizeof(dbcc);
+    dbcc.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    for (const wchar_t* cls : {L"SDL_HIDAPI_DEVICE_DETECTION", L"Message"}) {
+        HWND hwnd = nullptr;
+        while ((hwnd = FindWindowExW(HWND_MESSAGE, hwnd, cls, nullptr)) != nullptr) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != self_pid) continue;
+            SendMessageTimeoutW(hwnd, WM_DEVICECHANGE, DBT_DEVICEARRIVAL, reinterpret_cast<LPARAM>(&dbcc),
+                                SMTO_ABORTIFHUNG, 20, nullptr);
+        }
+    }
+}
+
 void sync_gamepads(bool allow_close, uint64_t now) {
     State& s = g();
     int count = 0;
@@ -1989,6 +2010,26 @@ void sync_gamepads(bool allow_close, uint64_t now) {
             for (Device* d : s.connected) known |= d->id == jid;
         }
         if (!known) open_pad(jid, now);
+    }
+
+    if (allow_close) {
+        bool physical_connected = false;
+        bool physical_disconnected = false;
+        {
+            std::lock_guard lock(s.mu);
+            for (const Device* d : s.devices) {
+                if (d->is_virtual || d->info.deviceFamily == GameInputFamilyAggregate) continue;
+                if (d->status.load() == GameInputDeviceNoStatus)
+                    physical_disconnected = true;
+                else
+                    physical_connected = true;
+            }
+        }
+        static uint64_t last_nudge_us = 0;
+        if ((physical_disconnected || !physical_connected) && now - last_nudge_us >= 2'500'000) {
+            last_nudge_us = now;
+            nudge_sdl_hotplug();
+        }
     }
 }
 
