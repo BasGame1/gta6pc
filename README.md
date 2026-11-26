@@ -1,7 +1,7 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/gta2pc.png" alt="logo" width="500">
+  <img src="assets/logo.png" alt="logo" width="500">
 </a>
 </h1>
 <h2 align="center"> <br>
