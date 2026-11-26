@@ -79,7 +79,7 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
-// LEONIDA_TITLE_HEAP=1: the title's XMemAlloc blocks come from a heap of their own instead of the CRT heap. Slot-133
+// The title's XMemAlloc blocks come from a heap of their own instead of the CRT heap (LEONIDA_TITLE_HEAP=0: not). Slot-133
 // imports pin title memory page by page for the GPU, and on the CRT heap a pinned page also holds the runtime's own
 // objects (g_pages' nodes among them): a GPU store past a buffer's end, or into a block freed while its import still
 // lived, then corrupted the runtime (speed-30/41/49-52: g_pages found corrupt under g_phys_mutex). Each block keeps its
@@ -90,8 +90,9 @@ struct TitleHeapHeader {
 };
 HANDLE title_heap() {
     static const HANDLE heap = [] {
+        // Set LEONIDA_TITLE_HEAP=0 to use the CRT heap.
         const char* v = std::getenv("LEONIDA_TITLE_HEAP");
-        if (!v || std::strcmp(v, "1") != 0) return HANDLE(nullptr);
+        if (v && std::strcmp(v, "0") == 0) return HANDLE(nullptr);
         const HANDLE h = HeapCreate(0, 0, 0);
         std::fprintf(stderr, "[rt] xmem: XMemAlloc blocks come from a heap of their own (%p)\n", h);
         return h;
@@ -146,7 +147,12 @@ void free_title_block(void* p) {
     if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
     const size_t size = block_size(p);
     free_block(p);
-    if (p) leonida::title_memory_map::changed(p, size ? size : 1);
+    if (p) {
+        const auto from = reinterpret_cast<uintptr_t>(p);
+        const size_t bytes = size ? size : 1;
+        leonida::title_memory_map::changed(p, bytes);
+        leonida::geometry_writes::note_released(from, from + bytes);
+    }
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
@@ -392,7 +398,7 @@ uintptr_t stream_cpu, stream_gpu, stream_size;
 bool mirror_stream;
 leonida::host_heap::map<uintptr_t, Window> stream_offsets;
 std::mutex g_phys_mutex;
-std::map<uintptr_t, Window> g_windows;              // base -> window
+leonida::host_heap::map<uintptr_t, Window> g_windows;  // base -> window (host_heap: see g_pages)
 // The same table for the fault handler, which may not wait for g_phys_mutex: a holder of that mutex allocates
 // (g_mapped, g_windows) and the faulting title thread can hold the process heap's lock (see g_fault_lock). Host heap,
 // read and written under g_fault_lock.
@@ -401,7 +407,10 @@ leonida::host_heap::map<uintptr_t, Window> g_fault_windows;
 // until the title releases them (TitleVirtualFree). With the windows these are the title's reserved memory: the only
 // place the fault handler commits a mapped section page it has no view of (commit_title_section_page).
 leonida::host_heap::map<uintptr_t, Window> g_title_placeholders;
-std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
+// Keep page table nodes on the runtime heap alongside the window table.
+std::unordered_map<uint64_t, PhysicalPage, std::hash<uint64_t>, std::equal_to<uint64_t>,
+                   leonida::host_heap::Allocator<std::pair<const uint64_t, PhysicalPage>>>
+    g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
 // A mapped run: `count` pages of one section at consecutive offsets, mapped as one view at its base. One view per run
@@ -818,10 +827,15 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     const DWORD host_type = allocation_type & kXmemHostAllocationTypeMask;
     if (result && host_type && !(host_type & MEM_COMMIT)) {
         const bool gpu_only = (protect & kPageGraphicsMask) && host_protect(protect) == PAGE_NOACCESS;
-        if (leonida::title_gpu_views::note_reservation(reinterpret_cast<uintptr_t>(result), size, gpu_only))
-            std::fprintf(stderr, "[rt] xmem: GPU-only view %p (%llu MiB, protect 0x%lx) reads at the CPU view %p\n",
+        const auto base = reinterpret_cast<uintptr_t>(result);
+        const bool stream_queue_view = allocation_type == 0x20402000 && gpu_only &&
+            reinterpret_cast<uintptr_t>(_ReturnAddress()) - kTitleImage == 0x1e1d03e &&
+            rt::xmem::slot31_runs() && rt::xmem::queue_page_mappings_enabled();
+        if (leonida::title_gpu_views::note_reservation(base, size, gpu_only, stream_queue_view))
+            std::fprintf(stderr, "[rt] xmem: GPU-only view %p (%llu MiB, protect 0x%lx) paired with CPU view %p (%s)\n",
                          result, static_cast<unsigned long long>(size >> 20), static_cast<unsigned long>(protect),
-                         reinterpret_cast<void*>(leonida::title_gpu_views::to_cpu(reinterpret_cast<uintptr_t>(result))));
+                         reinterpret_cast<void*>(leonida::title_gpu_views::other_view(base)),
+                         stream_queue_view ? "separate queue mappings" : "CPU backing");
         else if (gpu_only && size >= (64u << 20))
             std::fprintf(stderr, "[rt] xmem: GPU-only reservation %p (%llu MiB, protect 0x%lx) has no CPU view\n", result,
                          static_cast<unsigned long long>(size >> 20), static_cast<unsigned long>(protect));
@@ -1049,11 +1063,61 @@ constexpr size_t kUnmapRecords = 1024;
 UnmapRecord g_unmaps[kUnmapRecords];
 uint64_t g_unmap_count = 0;
 thread_local const char* t_unmap_cause = "unmap";
+
+// A remap of physical pages (XMemMapPhysicalPages with pages, the scatter call, CopyPageMappingsBatchX): the pages
+// whose frame it took away. unmap_range_locked records each page that held a frame while one is installed (under the
+// fault lock: host_heap only, nothing else); when it goes, with g_phys_mutex still held and the fault lock not, every
+// page now mapped to another frame than it had (or to none) is reported as released, in runs, so the geometry copies
+// over it are retired as over freed or unmapped memory (geometry_writes::note_released, GeometryViews::drain_released):
+// the title streams by remapping the frames of its pools, and the copies of what those pages held before were kept
+// for the device's life. A page mapped again to the frame it had is no change. LEONIDA_GEOMETRY_REMAP_RELEASE=0: off.
+bool remap_releases_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_GEOMETRY_REMAP_RELEASE");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+struct RemapReleases;
+thread_local RemapReleases* t_remap_releases = nullptr;
+struct RemapReleases {
+    leonida::host_heap::vector<std::pair<uintptr_t, uint64_t>> pages;  // address, the frame it had
+    bool active = false;
+    RemapReleases() {
+        if (!t_remap_releases && remap_releases_enabled()) {
+            t_remap_releases = this;
+            active = true;
+        }
+    }
+    RemapReleases(const RemapReleases&) = delete;
+    RemapReleases& operator=(const RemapReleases&) = delete;
+    ~RemapReleases();  // g_phys_mutex held, the fault lock not
+};
 struct UnmapCause {
     const char* was;
     explicit UnmapCause(const char* cause) : was(std::exchange(t_unmap_cause, cause)) {}
     ~UnmapCause() { t_unmap_cause = was; }
 };
+
+RemapReleases::~RemapReleases() {
+    if (!active) return;
+    t_remap_releases = nullptr;
+    if (pages.empty()) return;
+    std::sort(pages.begin(), pages.end());
+    uintptr_t run_begin = 0, run_end = 0;
+    for (const auto& [at, frame] : pages) {
+        const auto now = g_mapped.find(at);
+        if (now != g_mapped.end() && now->second == frame) continue;  // the frame it had: no change
+        if (run_end == at && run_end > run_begin) {
+            run_end = at + kPhysicalPageSize;
+            continue;
+        }
+        if (run_end > run_begin) leonida::geometry_writes::note_released(run_begin, run_end);
+        run_begin = at;
+        run_end = at + kPhysicalPageSize;
+    }
+    if (run_end > run_begin) leonida::geometry_writes::note_released(run_begin, run_end);
+}
 
 // With g_fault_lock held exclusively. Unmaps every page in [start, end); the addresses become placeholders again. A
 // view that reaches outside the range is unmapped whole, and its pages outside the range are mapped again, so
@@ -1081,6 +1145,7 @@ bool unmap_range_locked(uintptr_t start, uintptr_t end) {
         // The pages of [start, end) this view held are unmapped now; the ones outside it are mapped again below.
         for (uintptr_t at = (std::max)(base, start); at < (std::min)(view_end, end); at += kPhysicalPageSize) {
             if (const auto mapped = g_mapped.find(at); mapped != g_mapped.end()) {
+                if (t_remap_releases) t_remap_releases->pages.emplace_back(at, mapped->second);
                 note_mapping(mapped->second, at, false);
                 g_mapped.erase(mapped);
             }
@@ -1853,11 +1918,17 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     }
     drain_fault_notes();
     const std::lock_guard lock(g_phys_mutex);
+    RemapReleases remap_releases;  // reported as it goes: after the fault lock, with g_phys_mutex
     const uintptr_t end = start + page_count * kPhysicalPageSize;
     const UnmapCause cause(page_array ? "XMemMapPhysicalPages (remap)" : "XMemMapPhysicalPages (unmap)");
     if (!page_array) {
-        const FaultLockExclusive view_lock;
-        return unmap_range_locked(start, end) ? address : nullptr;
+        bool ok = false;
+        {
+            const FaultLockExclusive view_lock;
+            ok = unmap_range_locked(start, end);
+        }
+        if (ok) leonida::geometry_writes::note_released(start, end);
+        return ok ? address : nullptr;
     }
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
@@ -1971,6 +2042,7 @@ BOOL scatter_refused(ScatterFailure reason, uintptr_t address, DWORD error) {
 BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_count, const uint64_t* page_array) {
     drain_fault_notes();
     const std::lock_guard lock(g_phys_mutex);
+    RemapReleases remap_releases;
     if (page_count && !addresses) {
         return scatter_refused(ScatterFailure::missing_addresses, 0, ERROR_INVALID_PARAMETER);
     }
@@ -1983,6 +2055,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
             return scatter_refused(ScatterFailure::unaligned, address, ERROR_INVALID_PARAMETER);
         }
         const uint64_t page = page_array ? page_array[i] : 0;
+        const UnmapCause cause(page ? "XMemMapPhysicalPagesScatter (remap)" : "XMemMapPhysicalPagesScatter (unmap)");
         if (page == 0) {
             if (!unmap_page(address)) return scatter_refused(ScatterFailure::unmap, address, GetLastError());
             continue;
@@ -2005,6 +2078,34 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
 // calls with the same page make them. Every source page is looked up before any destination page changes, so a source
 // range that overlaps the destination maps what was there before the call. A destination in a GPU-only range is mapped
 // at its paired CPU range too (title_gpu_views), and a source page missing at a GPU-only address is looked up there.
+// A page of that CPU range the title mapped itself is the title's (title_mapped_twin): the copy leaves it as it is.
+
+// With g_phys_mutex held. True when the paired CPU page at `address` holds a mapping of the title's own: its
+// XMemMapPhysicalPages or XMemMapPhysicalPagesScatter call, or a slot-31 copy onto that address. The console's
+// CopyPageMappingsBatchX changes only the GPU-only range's page table, so such a page keeps what the title put
+// there; only a page the copy mirrored there itself (MapOwner::mirror), a zero plant, or a page with no mapping
+// follows the GPU-only range. Each page kept is counted, and the first ones logged.
+bool title_mapped_twin(uintptr_t address, uintptr_t gpu, bool unmap) {
+    MapOwner owner;
+    {
+        const FaultLockShared faults;
+        uintptr_t base = 0;
+        const View* const view = covering_view(address, base);
+        if (!view || view->zero || view->owner == MapOwner::mirror) return false;
+        owner = view->owner;
+    }
+    static std::atomic<uint64_t> kept{0};
+    const uint64_t n = kept.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n & (n - 1)) == 0)
+        std::fprintf(stderr,
+                     "[rt] xmem: slot-31 %s at 0x%llx left the title's %s mapping at its paired CPU page 0x%llx "
+                     "(%llu such pages so far)\n",
+                     unmap ? "unmap" : "copy", static_cast<unsigned long long>(gpu),
+                     owner == MapOwner::scatter ? "scatter" : owner == MapOwner::slot31 ? "slot-31" : "physical",
+                     static_cast<unsigned long long>(address), static_cast<unsigned long long>(n));
+    return true;
+}
+
 bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
     const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
     const uintptr_t from = reinterpret_cast<uintptr_t>(source);
@@ -2020,6 +2121,7 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     }
     const auto started = std::chrono::steady_clock::now();
     const std::lock_guard lock(g_phys_mutex);
+    RemapReleases remap_releases;
     // The destination is usually a GPU-only reservation, which the D3D12 layer reads at its paired CPU view
     // (title_gpu_views::to_cpu); that view gets the same pages, or it would stay reserved and never readable.
     const uintptr_t cpu_to = leonida::title_gpu_views::to_cpu(to, pages * kPhysicalPageSize);
@@ -2027,7 +2129,19 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     if (!source) {
         const UnmapCause cause("CopyPageMappingsBatchX (unmap range)");
         if (!unmap_range(to, to + pages * kPhysicalPageSize)) return false;
-        if (cpu_window && !unmap_range(cpu_to, cpu_to + pages * kPhysicalPageSize)) return false;
+        if (cpu_window) {
+            uint64_t run_start = pages;
+            for (uint64_t i = 0; i < pages; ++i) {
+                const bool keep = title_mapped_twin(cpu_to + i * kPhysicalPageSize, to + i * kPhysicalPageSize, true);
+                if (!keep && run_start == pages) run_start = i;
+                if ((keep || i + 1 == pages) && run_start < pages) {
+                    const uint64_t run_end = keep ? i : pages;
+                    if (!unmap_range(cpu_to + run_start * kPhysicalPageSize, cpu_to + run_end * kPhysicalPageSize))
+                        return false;
+                    run_start = pages;
+                }
+            }
+        }
         return true;
     }
     const Window* const window = find_window(to, pages * kPhysicalPageSize);
@@ -2052,11 +2166,12 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
             found[static_cast<size_t>(i)] = lookup_src_page(from + i * kPhysicalPageSize);
     }
 
-    auto apply_target = [&](uintptr_t dst_base, DWORD dst_protect, MapOwner owner) -> bool {
+    auto apply_target = [&](uintptr_t dst_base, DWORD dst_protect, MapOwner owner, bool check_title_twins) -> bool {
         // Capping coalesced views keeps initial multi-page copies fast without causing huge splits on later edits.
         constexpr uint64_t kCopyMaxViewPages = 32;
         auto needs_change = [&](uint64_t i) {
             const uintptr_t at = dst_base + i * kPhysicalPageSize;
+            if (check_title_twins && title_mapped_twin(at, to + i * kPhysicalPageSize, false)) return false;
             const uint64_t page = found[static_cast<size_t>(i)];
             const auto ex = g_mapped.find(at);
             if (page != 0) return ex == g_mapped.end() || ex->second != page;
@@ -2129,14 +2244,14 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
                 if (map_error != ERROR_SUCCESS) SetLastError(map_error);
                 return false;
             }
-            s = e;
+            s = e + 1;
         }
         return true;
     };
 
     const DWORD protect = view_protect(*window);
-    if (!apply_target(to, protect, MapOwner::slot31)) return false;
-    if (cpu_window && !apply_target(cpu_to, view_protect(*cpu_window), MapOwner::mirror)) return false;
+    if (!apply_target(to, protect, MapOwner::slot31, false)) return false;
+    if (cpu_window && !apply_target(cpu_to, view_protect(*cpu_window), MapOwner::mirror, true)) return false;
     const auto elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     if (elapsed_ms >= 200) {
@@ -2323,6 +2438,14 @@ BOOL title_release(void* address, SIZE_T size, DWORD free_type, const void* call
 BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     drain_fault_notes();
     const bool releases = (free_type & MEM_RELEASE) && !(free_type & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS));
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    uintptr_t release_end = 0;
+    if (releases && address) allocation_extent(address, release_end);
+    uintptr_t decommit_end = 0;
+    if ((free_type & MEM_DECOMMIT) && address) {
+        decommit_end = size ? start + size : leonida::title_write_watch::end_of(start);
+        if (decommit_end <= start) allocation_extent(address, decommit_end);
+    }
     BOOL result;
     if (releases) {
         result = title_release(address, size, free_type, _ReturnAddress());
@@ -2340,6 +2463,10 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     if (result && (free_type & MEM_DECOMMIT)) note_unwatched_change(address, size, 0, true);
     if (result && (free_type & MEM_RELEASE) && !(free_type & MEM_PRESERVE_PLACEHOLDER))
         leonida::title_write_watch::remove(reinterpret_cast<uintptr_t>(address));
+    if (result && releases && release_end > start)
+        leonida::geometry_writes::note_released(start, release_end);
+    if (result && (free_type & MEM_DECOMMIT) && decommit_end > start)
+        leonida::geometry_writes::note_released(start, decommit_end);
     return result;
 }
 
@@ -2495,6 +2622,7 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
     std::vector<uint64_t> frames;
     drain_fault_notes();
     const std::lock_guard lock(g_phys_mutex);
+    RemapReleases remap_releases;
     try {
         for (uint32_t b = 0; b < count; ++b) {
             const auto& batch = batches[b];
@@ -2561,6 +2689,7 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
             if (!mirror && r.spec.kind == 2) {
                 const UnmapCause cause("CopyPageMappingsBatchX (unmap range)");
                 ok = unmap_range(r.at, r.at + bytes);
+                if (ok) leonida::geometry_writes::note_released(r.at, r.at + bytes);
             } else if (!mirror && !slot31_runs()) {
                 for (uint32_t j = 0; j < r.spec.count; ++j) {
                     const auto at = r.at + uint64_t(j) * kPhysicalPageSize;
