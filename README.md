@@ -1,10 +1,8 @@
-<p align="left">
+<p align="center">
   <a href="https://github.com/BasGame1/gta2pc">
     <img src="assets/gta2pc.png" alt="gta2pc" width="320">
   </a>
 </p>
-
-# gta2pc
 
 **Native Windows & Linux compatibility runtime and asset toolchain for *Grand Theft Auto VI* (Xbox Series).**
 
@@ -33,9 +31,9 @@ Instead of emulating the entire Xbox Series console, `gta2pc` translates the gam
 
 ### Current Progress
 
-**Playability:** Boots through intro cinematics, initial setup menus, and story loading on Windows and Linux/Proton; stops before 3D world rendering.
+**Playability:** Boots through intro cinematics, initial setup menus, and story loading screen on Windows and Linux/Proton; stops before 3D world rendering.
 
-- ✅ **Boot & Menu Flow:** Intro videos and story-mode loading verified ([Linux/Proton report](docs/linux_proton.md))
+- ✅ **Boot & Menu Flow:** Intro videos and story-mode loading screen verified ([Linux/Proton report](docs/linux_proton.md))
 - ✅ **Shader Compilation:** **26,503 / 26,503** RDNA2 shaders converted to SPIR-V (`spirv-val` clean)
 - ✅ **Asset Extraction:** **382,781** OBJ meshes, BC1–BC7 DDS textures, and **1,589** radio/AWC entries unpacked
 - ⚠️ **Graphics & World Frame:** Core D3D12→Vulkan proxy and GPU BVH4 builder working; 3D world rendering in progress
@@ -72,5 +70,4 @@ cd gta2pc
 
 - **GitHub:** https://github.com/BasGame1/gta2pc
 - **GitLab:** https://gitlab.com/BasGame1/gta2pc
-- **Discord:** https://discord.gg/ETf4qj5acN
 - **Telegram:** https://t.me/PixelifyNext
