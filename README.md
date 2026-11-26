@@ -1,94 +1,76 @@
-<h1 align="center">
-  <br>
+<p align="left">
   <a href="https://github.com/BasGame1/gta2pc">
-    <img src="assets/gta2pc.png" alt="gta2pc logo" width="500">
+    <img src="assets/gta2pc.png" alt="gta2pc" width="320">
   </a>
-</h1>
-
-<h2 align="center">
-  <br>
-  ![microsoft](https://www.readmecodegen.com/api/social-icon?name=microsoft&size=32)
-  ![python](https://www.readmecodegen.com/api/social-icon?name=python&size=32&color=%2310b981)
-  ![linux](https://www.readmecodegen.com/api/social-icon?name=linux&size=32)
-  ![xbox](https://www.readmecodegen.com/api/social-icon?name=xbox&size=32)
-  ![rockstargames](https://www.readmecodegen.com/api/social-icon?name=rockstargames&size=32)
-</h2>
-
-<h4 align="center">
-  Grand Theft Auto VI (Xbox Series) running natively on Windows and Linux via static recompilation — compiled locally from your own retail files.
-</h4>
-
-<p align="center">
-  <a href="docs/i18n/README.md">Other languages</a> |
-  <a href="#how-to-build">How to build</a> |
-  <a href="#architecture-overview">Architecture</a> |
-  <a href="#project-status">Project status</a> |
-  <a href="#platforms">Platforms</a> |
-  <a href="docs/status.md">Detailed Status</a> |
-  <a href="docs/objectives.md">Objectives</a> |
-  <a href="https://discord.gg/ETf4qj5acN">Discord</a> |
-  <a href="https://t.me/PixelifyNext">Telegram</a>
 </p>
 
----
+# gta2pc
 
-> [!IMPORTANT]
-> **No copyrighted game files, encryption keys, or precompiled binaries are included in this repository.**
-> You must supply your own legally acquired Xbox Series package (`1.0.2.1`) already unpacked on disk. This toolchain does not bypass DRM or package encryption. All extracted textures, translated SPIR-V shaders, and runtime binaries are generated locally on your machine and must never be redistributed.
+**Native Windows & Linux compatibility runtime and asset toolchain for *Grand Theft Auto VI* (Xbox Series).**
 
-> [!NOTE]
-> **Upstream Lineage:** `gta2pc` is an active continuation and experimental fork building upon [NotRexed's original Leonida static recompilation framework](https://github.com/ItsNotRexed/Leonida) and [ubiquitarianism's Leonida Continued](https://github.com/ubiquitarianism/leonida), focused on Linux/Proton stability, build pipeline refinements, and runtime compatibility fixes.
+![microsoft](https://www.readmecodegen.com/api/social-icon?name=microsoft&size=28)
+![python](https://www.readmecodegen.com/api/social-icon?name=python&size=28&color=%2310b981)
+![linux](https://www.readmecodegen.com/api/social-icon?name=linux&size=28)
+![xbox](https://www.readmecodegen.com/api/social-icon?name=xbox&size=28)
+![rockstargames](https://www.readmecodegen.com/api/social-icon?name=rockstargames&size=28)
 
----
+[Translations](docs/i18n/README.md) • [Installation](#installation) • [Architecture & Benchmarks](docs/architecture.md) • [Status Logs](docs/status.md) • [Roadmap](docs/objectives.md) • [Discord](https://discord.gg/ETf4qj5acN) • [Telegram](https://t.me/PixelifyNext)
 
-## Architecture Overview
-
-**gta2pc** translates the Xbox Series edition of *Grand Theft Auto VI* into a native desktop runtime without full-system CPU emulation:
-
-* **Native x86-64 Execution:** Because the Xbox Series console shares the x86-64 instruction set with modern PCs, the game's compiled machine code is loaded directly through a custom PE loader (`gta6rt`) paired with user-mode shims for Xbox GDK and OS kernel APIs.
-* **RDNA2 to SPIR-V Shader Translation:** Precompiled console GPU microcode is unpacked from the game archives, disassembled, and translated into standard Vulkan SPIR-V modules—including wave64 subgroup emulation for 32-wide NVIDIA and Intel GPUs.
-* **Xbox D3D12-to-Vulkan Translation Layer:** Console-specific Direct3D 12 extensions, command-list layouts, `PresentX` swapchain queues, and XDXR ray-tracing acceleration structures (BVH4) are mapped onto standard desktop Vulkan APIs.
-* **Local Asset Extraction Pipeline:** RPF9 archives, BCPack-compressed texture dictionaries, AWC audio banks, and 3D world geometry are decoded locally from your game directory during the build step.
+> **Legal & Local-Only Notice:** This repository contains source code and build scripts only—no game binaries, keys, or copyrighted assets are included. You must supply an unpacked Xbox Series retail copy (`v1.0.2.1`) locally on disk.
 
 ---
 
-## Project Status
+### How It Works
 
-**Current State: Bootable through initial UI and story load; in-game 3D world rendering is still under active development.**
+Instead of emulating the entire Xbox Series console, `gta2pc` translates the game's layers directly to native PC APIs:
 
-On native Windows and Linux (via Proton), `gta2pc` launches the game binary from your local package, plays the startup sequence, navigates the initial setup screens, and completes the story-mode loading phase before reaching the world initialization stage. Automated UI progression (`LEONIDA_INPUT_SCRIPT`) is also functional on Windows for unattended testing.
-
-| Subsystem | Current Progress | Technical Notes |
-| :--- | :---: | :--- |
-| **Game Boot & Intro Sequence** | ✅ Working | Boots cleanly on Windows and Linux/Proton through intro movies, legal prompts, and story loading ([Linux report](docs/linux_proton.md)). |
-| **Gameplay & World Rendering** | ⚠️ In Progress | Reaches the end of the story load sequence; first playable 3D world frame is not yet verified. |
-| **Package Detection (`v1.0.2.1`)** | ✅ Working | Automatically locates unpacked Xbox Series `MicrosoftGame.Config` and `.rpf` directories on local drives. |
-| **RDNA2 Shader Disassembly & SPIR-V** | ✅ Complete | **26,503 / 26,503** shaders carved, translated to SPIR-V, and validated with `spirv-val` (supports native 64-wide AMD subgroups and emulated 32-wide NVIDIA/Intel subgroups). |
-| **3D Models & World Geometry** | ✅ Working | **382,781** models recovered across scanned archives (including `levels.rpf`) with UVs and material references intact ([notes](docs/models.md)). |
-| **Textures (BCPack → DDS)** | ✅ Working | Clean-room decoder (`tools/bcpack.py`) reconstructs BC1–BC7 textures into standard DDS pools ([notes](docs/textures.md)). |
-| **Audio & Radio Streams (AWC)** | ✅ Working | Lossless Ogg Opus repackaging, PCM WAV extraction, XMA2 decoding via FFmpeg, and **1,589** radio metadata records parsed ([notes](docs/audio.md)). |
-| **PE Loader & GameInput Shim** | ⚠️ Partial | Runs `gta6rt` with CRT/threading/file shims and SDL3 controller support (rumble, DualSense triggers/lightbar) ([notes](docs/gameinput.md)). |
-| **Xbox D3D12 → Vulkan Proxy** | ⚠️ In Progress | Core command lists, descriptors, barriers, render targets, and `PresentX` queues work; console list tail and descriptor-table edge cases remain ([plan](docs/d3d12_vulkan.md)). |
-| **Hardware Ray Tracing (XDXR BVH4)** | ⚠️ In Progress | GPU-side BLAS/TLAS builder and shader traversal (`image_bvh_intersect_ray`) verified on synthetic scenes; `*_bvh4.rpf` rehydration under investigation ([notes](docs/bvh.md)). |
+- **CPU & OS (`gta6rt`):** Runs the x86-64 game executable natively in user-space while shimming Xbox GDK and kernel calls to Windows or Wine/Proton.
+- **Shaders (RDNA2 → SPIR-V):** Extracts and recompiles all **26,503** console GPU shaders into validated Vulkan SPIR-V modules.
+- **Graphics & Ray Tracing:** Translates Xbox Direct3D 12 command lists, `PresentX` queues, and BVH4 acceleration structures onto desktop Vulkan.
+- **Asset Pipeline:** Unpacks RPF9 archives, BCPack textures (DDS), and AWC audio streams locally during build time.
 
 ---
 
-## Platforms
+### Current Progress
 
-| Operating System / GPU | Compatibility & Runtime Setup |
-| :--- | :--- |
-| **Windows 10 / 11 (x64)** | Primary target. Builds and runs `make_game.py`, asset extractors, and the native `gta6rt` D3D12-to-Vulkan runtime directly. |
-| **Linux (x86-64)** | Asset tools, shader translators, and Vulkan test suites compile natively (tested on Mesa RADV and NVIDIA proprietary drivers). The Windows runtime cross-compiles via `clang-cl` + `xwin` and runs under Wine/Proton (`./Build.sh`, see [docs/linux.md](docs/linux.md)). |
-| **macOS (Apple Silicon)** | Python asset tools and Vulkan tests run natively via MoltenVK; the Windows runtime executes under CrossOver / Wine with FEX or Rosetta (geometry/mesh shaders skipped due to MoltenVK limits, see [docs/testing.md](docs/testing.md)). |
-| **AMD RDNA1 / RDNA2 / RDNA3+** | Recommended GPU architecture for testing due to native 64-wide wave execution matching the Xbox Series RDNA2 GPU without subgroup emulation overhead. |
+**Playability:** Boots through intro cinematics, initial setup menus, and story loading on Windows and Linux/Proton; stops before 3D world rendering.
+
+- ✅ **Boot & Menu Flow:** Intro videos and story-mode loading verified ([Linux/Proton report](docs/linux_proton.md))
+- ✅ **Shader Compilation:** **26,503 / 26,503** RDNA2 shaders converted to SPIR-V (`spirv-val` clean)
+- ✅ **Asset Extraction:** **382,781** OBJ meshes, BC1–BC7 DDS textures, and **1,589** radio/AWC entries unpacked
+- ⚠️ **Graphics & World Frame:** Core D3D12→Vulkan proxy and GPU BVH4 builder working; 3D world rendering in progress
+
+*(See [docs/architecture.md](docs/architecture.md) for full subsystem breakdowns and GPU compatibility tables.)*
 
 ---
 
-## How to Build
+### Installation
 
-Everything is compiled and extracted directly on your PC from your existing game installation:
+**Requirements:** Windows 10/11 (x64) or 64-bit Linux (Wine/Proton) • Vulkan 1.3 GPU • ~400 GB free disk space • Unpacked Xbox Series `1.0.2.1` directory (`MicrosoftGame.Config` + `.rpf` files).
 
-1. **Clone the repository with submodules:**
-   ```bash
-   git clone --recursive [https://github.com/BasGame1/gta2pc.git](https://github.com/BasGame1/gta2pc.git)
-   cd gta2pc
+```bash
+git clone --recursive [https://github.com/BasGame1/gta2pc.git](https://github.com/BasGame1/gta2pc.git)
+cd gta2pc
+```
+
+- **Windows:** Run `Build.bat`
+- **Linux / macOS:** Run `./Build.sh` (see [docs/linux.md](docs/linux.md) for required packages)
+
+<details>
+<summary><b>Build & Fork Notes</b></summary>
+<br>
+
+- **Submodules:** Always clone with `--recursive` so `third_party/rpf9-explorer` is fetched; GitHub's "Download ZIP" omits submodules.
+- **Output Path:** The builder auto-detects your local game folder across standard user directories/drive roots and outputs the compiled runtime to `Documents\Leonida`.
+- **Upstream Lineage:** `gta2pc` builds upon [NotRexed's Leonida](https://github.com/ItsNotRexed/Leonida) and [ubiquitarianism's Leonida Continued](https://github.com/ubiquitarianism/leonida), focusing on Linux/Proton execution and build reliability.
+
+</details>
+
+---
+
+### Mirrors & Community
+
+- **GitHub:** https://github.com/BasGame1/gta2pc
+- **GitLab:** https://gitlab.com/BasGame1/gta2pc
+- **Discord:** https://discord.gg/ETf4qj5acN
+- **Telegram:** https://t.me/PixelifyNext
