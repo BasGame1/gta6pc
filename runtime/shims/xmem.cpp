@@ -1592,7 +1592,7 @@ LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
     MEMORY_BASIC_INFORMATION seen{};  // the page as the decision saw it
     char read_note[1024];
     DWORD read_note_size = 0;
-    bool plant_read = false, promote = false;
+    bool plant_read = false, promote = false, from_title = false;
     bool queried = false;
     {
         const FaultLockShared lock;
@@ -1611,7 +1611,8 @@ LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
             if (where != kNoReservation || access == 1)
                 queried = VirtualQuery(reinterpret_cast<const void*>(accessed), &seen, sizeof(seen)) != 0;
             const auto pc = reinterpret_cast<uintptr_t>(record->ExceptionAddress);
-            if (access == 0 && result == PageCommit::not_ours && title_code(pc)) {
+            from_title = access == 0 && result == PageCommit::not_ours && title_code(pc);
+            if (from_title) {
                 if (!queried) queried = VirtualQuery(reinterpret_cast<const void*>(accessed), &seen, sizeof(seen)) != 0;
                 read_note_size = describe_read(read_note, pc, accessed, seen);
                 plant_read = where == kInWindow && g_pool_zero_pages;
@@ -1687,7 +1688,8 @@ LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
         exit = FaultExit::committed;
     } else if (answered) {
         exit = FaultExit::answered;
-    } else if (result == PageCommit::committed_before && !escalated) {
+    } else if ((result == PageCommit::committed_before && !escalated) ||
+               (title_page && access == 0 && result == PageCommit::not_ours && !from_title)) {
         exit = FaultExit::passed_guarded;  // a guard's (the D3D12 layer's), routine: not noted
     } else if (title_page || reserved_write) {
         note_fault(kRefused, accessed, access, result, where, seen);

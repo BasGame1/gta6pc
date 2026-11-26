@@ -215,18 +215,24 @@ bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes,
 // (streaming, file reads, XG copies) or whole planes (video), never a few bytes inside a page. The same sampling as
 // OpenScarlett's texture hash before submission (src/gpu/d3d12_xs/device_x.cpp, f8e24d4, MIT), with more samples.
 // False when a page faults (the title unmapped it). No C++ objects here: it is a __try frame.
-inline std::uint64_t mix_words(std::uint64_t h, const std::uint8_t* at, std::size_t n) {
+#pragma pack(push, 1)
+struct UnalignedWord64 {
+    std::uint64_t value;
+};
+#pragma pack(pop)
+
+LEONIDA_GUARDED_NO_BUILTIN inline std::uint64_t mix_words(std::uint64_t h, const std::uint8_t* at, std::size_t n) {
     for (std::size_t i = 0; i + 8 <= n; i += 8) {
-        std::uint64_t w;
-        std::memcpy(&w, at + i, 8);
+        const std::uint64_t w = reinterpret_cast<const UnalignedWord64*>(at + i)->value;
         h = (h ^ w) * 0x100000001b3ull;
         h ^= h >> 29;
     }
     return h;
 }
 // The reads of hash_guarded, in a frame of its own: an inline load inside the __try is not covered by clang-cl
-// without /EHa (src/guarded_copy.h).
-__declspec(noinline) std::uint64_t hash_bytes(const std::uint8_t* p, std::size_t bytes, bool every_byte) {
+// without /EHa, and a CRT memcpy call is not covered under Wine (src/guarded_copy.h).
+__declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN std::uint64_t hash_bytes(const std::uint8_t* p, std::size_t bytes,
+                                                                         bool every_byte) {
     std::uint64_t h = 0x9e3779b97f4a7c15ull ^ bytes;
     if (bytes <= (256u << 10) || every_byte) {
         h = mix_words(h, p, bytes & ~std::size_t(7));
@@ -12716,6 +12722,8 @@ private:
         const bool guard = check_pages_before_read();
         if (!guard && !t.memory.pending()) return true;
         const bool mapped = t.mapped && refresh_mapped_pages();
+        if (!title_pass_ && guard && !mapped)
+            t.memory.sync_map(title_map_generation_, static_cast<std::uintptr_t>(t.cpu), t.layout.layout.size);
         const auto commit = mapped ? leonida::kernel_writes::state().committer.load(std::memory_order_acquire) : nullptr;
         const bool waited = t.memory.pending();
         // The answer is kept (generation 0) until a map change over the texture, a write into it or the periodic
