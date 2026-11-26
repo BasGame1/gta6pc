@@ -674,6 +674,13 @@ void test_copy_page_mappings(const PhysicalApi& api) {
     check(page_holds(pool + kPage64k, 0x7100u) && page_holds(pool + 2 * kPage64k, 0x7101u),
           "the overlapping run shows the pages from before it");
 
+    // Partial update inside a multi-page run, repeating the identical copy (no-op fast path) and mixed holes.
+    check(copy(heap, pool, 3, false), "a multi-page run maps onto heap");
+    check(copy(heap, pool, 3, false), "repeating the identical multi-page run keeps its contents");
+    check(copy(heap + kPage64k, pool + 3 * kPage64k, 1, false), "updating one middle page to a hole preserves neighbours");
+    check(page_holds(heap, 0x7100u) && reserved_only(heap + kPage64k) && page_holds(heap + 2 * kPage64k, 0x7101u),
+          "neighbours of the unmapped middle page remain mapped");
+
     uint8_t outside = 0;
     const auto outside_page =
         reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(&outside) + 0xffff) & ~uintptr_t{0xffff});

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2014,16 +2015,16 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
         SetLastError(ERROR_NOT_SUPPORTED);
         return false;
     }
+    const auto started = std::chrono::steady_clock::now();
     const std::lock_guard lock(g_phys_mutex);
     // The destination is usually a GPU-only reservation, which the D3D12 layer reads at its paired CPU view
     // (title_gpu_views::to_cpu); that view gets the same pages, or it would stay reserved and never readable.
     const uintptr_t cpu_to = leonida::title_gpu_views::to_cpu(to, pages * kPhysicalPageSize);
     const Window* const cpu_window = cpu_to != to ? find_window(cpu_to, pages * kPhysicalPageSize) : nullptr;
     if (!source) {
-        for (uint64_t i = 0; i < pages; ++i) {
-            if (!unmap_page(to + i * kPhysicalPageSize)) return false;
-            if (cpu_window && !unmap_page(cpu_to + i * kPhysicalPageSize)) return false;
-        }
+        const UnmapCause cause("CopyPageMappingsBatchX (unmap range)");
+        if (!unmap_range(to, to + pages * kPhysicalPageSize)) return false;
+        if (cpu_window && !unmap_range(cpu_to, cpu_to + pages * kPhysicalPageSize)) return false;
         return true;
     }
     const Window* const window = find_window(to, pages * kPhysicalPageSize);
@@ -2031,22 +2032,116 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
     }
-    std::vector<uint64_t> found(static_cast<size_t>(pages), 0);
-    for (uint64_t i = 0; i < pages; ++i) {
-        const uintptr_t src_va = from + (repeat_first ? 0 : i) * kPhysicalPageSize;
+    auto lookup_src_page = [](uintptr_t src_va) -> uint64_t {
         auto it = g_mapped.find(src_va);
         if (it == g_mapped.end()) {  // a GPU-only source whose pages were mapped at its CPU view
             const uintptr_t cpu_src = leonida::title_gpu_views::to_cpu(src_va, kPhysicalPageSize);
             if (cpu_src != src_va) it = g_mapped.find(cpu_src);
         }
-        if (it != g_mapped.end()) found[static_cast<size_t>(i)] = it->second;
+        return it != g_mapped.end() ? it->second : 0;
+    };
+    leonida::host_heap::vector<uint64_t> found(static_cast<size_t>(pages), 0);
+    if (repeat_first) {
+        const uint64_t single = lookup_src_page(from);
+        if (single) std::fill(found.begin(), found.end(), single);
+    } else {
+        for (uint64_t i = 0; i < pages; ++i)
+            found[static_cast<size_t>(i)] = lookup_src_page(from + i * kPhysicalPageSize);
     }
+
+    auto apply_target = [&](uintptr_t dst_base, DWORD dst_protect, MapOwner owner) -> bool {
+        // Capping coalesced views keeps initial multi-page copies fast without causing huge splits on later edits.
+        constexpr uint64_t kCopyMaxViewPages = 32;
+        auto needs_change = [&](uint64_t i) {
+            const uintptr_t at = dst_base + i * kPhysicalPageSize;
+            const uint64_t page = found[static_cast<size_t>(i)];
+            const auto ex = g_mapped.find(at);
+            if (page != 0) return ex == g_mapped.end() || ex->second != page;
+            if (ex != g_mapped.end()) return true;
+            const FaultLockShared faults;
+            return view_covers(at);
+        };
+        for (uint64_t s = 0; s < pages;) {
+            if (!needs_change(s)) {
+                ++s;
+                continue;
+            }
+            uint64_t e = s + 1;
+            while (e < pages && needs_change(e)) ++e;
+            uint64_t mapped_end = s;
+            bool ok = true;
+            DWORD map_error = ERROR_SUCCESS;
+            {
+                const FaultLockExclusive view_lock;
+                const UnmapCause cause("CopyPageMappingsBatchX (remap run)");
+                if (!unmap_range_locked(dst_base + s * kPhysicalPageSize, dst_base + e * kPhysicalPageSize)) {
+                    map_error = GetLastError();
+                    ok = false;
+                } else {
+                    fault_race_point(rt::xmem::kRemapBetween);
+                    for (uint64_t k = s; k < e;) {
+                        const uint64_t page = found[static_cast<size_t>(k)];
+                        if (page == 0) {
+                            ++k;
+                            continue;
+                        }
+                        const auto first = g_pages.find(page);
+                        if (first == g_pages.end()) {
+                            map_error = ERROR_INVALID_PARAMETER;
+                            ok = false;
+                            break;
+                        }
+                        uint64_t n = 1;
+                        while (k + n < e && n < kCopyMaxViewPages) {
+                            const uint64_t npage = found[static_cast<size_t>(k + n)];
+                            if (!npage) break;
+                            const auto next = g_pages.find(npage);
+                            if (next == g_pages.end() || next->second.section != first->second.section ||
+                                next->second.offset != first->second.offset + n * kPhysicalPageSize)
+                                break;
+                            ++n;
+                        }
+                        uint64_t done = 0;
+                        if (!map_view(dst_base + k * kPhysicalPageSize,
+                                      View{n, first->second.section, first->second.offset, dst_protect, false, false, owner},
+                                      &done)) {
+                            map_error = GetLastError();
+                            mapped_end = k + done;
+                            ok = false;
+                            break;
+                        }
+                        k += n;
+                        mapped_end = k;
+                    }
+                }
+            }
+            for (uint64_t k = s; k < mapped_end; ++k) {
+                const uint64_t page = found[static_cast<size_t>(k)];
+                if (!page) continue;
+                const uintptr_t at = dst_base + k * kPhysicalPageSize;
+                g_mapped[at] = page;
+                note_mapping(page, at, true);
+            }
+            if (!ok) {
+                if (map_error != ERROR_SUCCESS) SetLastError(map_error);
+                return false;
+            }
+            s = e;
+        }
+        return true;
+    };
+
     const DWORD protect = view_protect(*window);
-    const DWORD cpu_protect = cpu_window ? view_protect(*cpu_window) : 0;
-    for (uint64_t i = 0; i < pages; ++i) {
-        const uint64_t page = found[static_cast<size_t>(i)];
-        if (!map_page(to + i * kPhysicalPageSize, page, protect, MapOwner::slot31)) return false;
-        if (cpu_window && !map_page(cpu_to + i * kPhysicalPageSize, page, cpu_protect, MapOwner::mirror)) return false;
+    if (!apply_target(to, protect, MapOwner::slot31)) return false;
+    if (cpu_window && !apply_target(cpu_to, view_protect(*cpu_window), MapOwner::mirror)) return false;
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    if (elapsed_ms >= 200) {
+        static std::atomic<unsigned> slow_logs{0};
+        if (slow_logs.fetch_add(1, std::memory_order_relaxed) < 16)
+            std::fprintf(stderr, "[rt] xmem: slow copy_page_mappings (%llu pages, repeat=%d) took %lld ms\n",
+                         static_cast<unsigned long long>(pages), repeat_first ? 1 : 0,
+                         static_cast<long long>(elapsed_ms));
     }
     return true;
 }
