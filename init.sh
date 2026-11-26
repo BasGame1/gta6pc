@@ -1,4 +1,4 @@
-. helper.sh || { echo "Could not load helper, exiting" && exit 255; }
+. helpers/helper.sh || { echo "Could not load helper, exiting" && exit 255; }
 
 banner;
 
