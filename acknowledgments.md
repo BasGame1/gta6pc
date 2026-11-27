@@ -34,6 +34,7 @@ Source repository: <https://github.com/ubiquitarianism/leonida>
 - **PR #2102 (`8bc59a74c`, `DadaCap`)**: Mesh shader epilogue tail fix (`tools/rdna2spirv.py`).
 - **PR #2440 (`d071531bc`, `OreoFR`)**: `LEONIDA_ASYNC_MIN_BYTES` keeps small pipelines synchronous so draws do not stall behind oversized background compiles (`runtime/src/async_pipeline_size.h`, `runtime/shims/d3d12_pipeline_compile.h`).
 - **PR #2401 (`fac8b4bb9`, `aslan2142`) & PR #2432 (`63185f4a3`, `OreoFR`)**: Runtime Vulkan memory breakdown diagnostics and `LEONIDA_TRACE_XGAMESAVE` logging.
+- **PR #2123 (`ef3493186`, `qhukz13`)**: Enables depth-stencil UAVs (`R16_TYPELESS` + `R8_UINT`) for console `D16S8` textures backed as `D24_UNORM_S8_UINT` on NVIDIA GPUs (`runtime/shims/d3d12_vulkan_device.cpp`, `runtime/src/vulkan_backend.h`, `runtime/src/vulkan_replay.h`, `runtime/test/xbox_depth_storage_test.cpp`).
 
 ### Open pull requests integrated from `ubiquitarianism/leonida`
 
@@ -53,6 +54,7 @@ Source repository: <https://github.com/ubiquitarianism/leonida>
 - **PR #2416 (`ninjahawk`)**: Lowers pixel shader `quad_perm` DPP reads through Vulkan quad operations instead of inactive-helper-lane shuffles, matching the shadow quad-hole fix also documented in `Belobug/VIctory-Belobug-AMD` (`tools/rdna2spirv.py`, `tests/semantic/test_dpp_quad_ops_ps.py`).
 - **PR #2439 (`OreoFR`)**: Decodes only written typed-load components and emits `fconst` as `OpConstant` (`tools/rdna2spirv.py`, `tests/semantic/test_buffer_format_decode_one.py`, `tests/semantic/test_fconst_constant.py`).
 - **PR #2434 (`z3r0rc`)**: Pins BCPack BC7 rank 152 to measured mode 3 (`tools/bcpack_tables_bptc.py`, `tests/test_bcpack.py`, `tests/test_bcpack_tables_bptc.py`).
+- **PR #2117 (`azsekazvamdimitar`)**: Memoizes console heap V# slot resolutions per pass so repeated V# words are resolved once (`runtime/shims/d3d12_vulkan_device.cpp`, `runtime/test/d3d12_unmapped_vsharp_test.cpp`).
 
 ## 3. PortWatch VI Reference Survey (`docs-only` / corroboration)
 
