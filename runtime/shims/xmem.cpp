@@ -2062,6 +2062,15 @@ bool title_mapped_twin(uintptr_t address, uintptr_t gpu, bool unmap) {
     return true;
 }
 
+auto find_mapped_source_page(uintptr_t src_va) {
+    auto it = g_mapped.find(src_va);
+    if (it == g_mapped.end()) {  // a GPU-only source whose pages were mapped at its CPU view
+        const uintptr_t cpu_src = leonida::title_gpu_views::to_cpu(src_va, kPhysicalPageSize);
+        if (cpu_src != src_va) it = g_mapped.find(cpu_src);
+    }
+    return it;
+}
+
 bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
     const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
     const uintptr_t from = reinterpret_cast<uintptr_t>(source);
@@ -2105,11 +2114,7 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
         return false;
     }
     auto lookup_src_page = [](uintptr_t src_va) -> uint64_t {
-        auto it = g_mapped.find(src_va);
-        if (it == g_mapped.end()) {  // a GPU-only source whose pages were mapped at its CPU view
-            const uintptr_t cpu_src = leonida::title_gpu_views::to_cpu(src_va, kPhysicalPageSize);
-            if (cpu_src != src_va) it = g_mapped.find(cpu_src);
-        }
+        const auto it = find_mapped_source_page(src_va);
         return it != g_mapped.end() ? it->second : 0;
     };
     leonida::host_heap::vector<uint64_t> found(static_cast<size_t>(pages), 0);
@@ -2619,7 +2624,7 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
                         const auto source = pool + uint64_t(r.start) * kPhysicalPageSize;
                         for (uint32_t j = 0; j < n; ++j) {
                             const auto src = source + uint64_t(j) * kPhysicalPageSize;
-                            const auto it = g_mapped.find(src);
+                            const auto it = find_mapped_source_page(src);
                             if (it == g_mapped.end()) {
                                 // A hole in a valid source window unmaps the destination (CLHelper, RT-QUEUE31).
                                 if (!find_window(src, kPhysicalPageSize))
