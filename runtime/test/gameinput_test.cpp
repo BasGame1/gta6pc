@@ -903,6 +903,28 @@ void test_keyboard_pad(IGameInput* input) {
     g_focus = true;
     test_keyboard_pad_sticks(input, kb);
 
+    // LEONIDA_KBM_GTA=1 maps GTA PC controls (Shift=A, Space=X, R=B, F=Y, C=R3) and LEONIDA_MOUSE_INVERT_Y=1 inverts Y.
+    set_env("LEONIDA_KBM_GTA", "1");
+    set_env("LEONIDA_MOUSE_INVERT_Y", "1");
+    rt::gameinput::reload_config();
+    g_keys[VK_LSHIFT] = g_keys[VK_SPACE] = g_keys['R'] = g_keys['F'] = g_keys['C'] = true;
+    g_cursor_x = 100;
+    g_cursor_y = 100;
+    rt::gameinput::poll();
+    g_cursor_y = 104;
+    rt::gameinput::poll();
+    const GameInputGamepadState gta = pad_state(input, kb);
+    check((gta.buttons & (GameInputGamepadA | GameInputGamepadX | GameInputGamepadB | GameInputGamepadY |
+                          GameInputGamepadRightThumbstick)) ==
+              (GameInputGamepadA | GameInputGamepadX | GameInputGamepadB | GameInputGamepadY |
+               GameInputGamepadRightThumbstick) &&
+              gta.rightThumbstickY > 0.0f,
+          "keyboard pad: LEONIDA_KBM_GTA binds GTA PC keys and LEONIDA_MOUSE_INVERT_Y inverts mouse Y");
+    g_keys[VK_LSHIFT] = g_keys[VK_SPACE] = g_keys['R'] = g_keys['F'] = g_keys['C'] = false;
+    set_env("LEONIDA_KBM_GTA", nullptr);
+    set_env("LEONIDA_MOUSE_INVERT_Y", nullptr);
+    rt::gameinput::reload_config();
+
     // Turning it off removes the pad; turning it on again brings back the same device object.
     set_env("LEONIDA_KEYBOARD_PAD", "off");
     rt::gameinput::reload_config();

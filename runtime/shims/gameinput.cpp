@@ -171,6 +171,8 @@ rt::gameinput::Config read_config() {
         c.ds_trigger_gain = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.0f, 4.0f);
     if (const std::string g = env("LEONIDA_MOUSE_SENSITIVITY"); !g.empty())
         c.mouse_sensitivity = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.1f, 10.0f);
+    if (env("LEONIDA_MOUSE_INVERT_Y") == "1") c.mouse_invert_y = true;
+    if (env("LEONIDA_KBM_GTA") == "1") c.kbm_gta = true;
     if (const std::string f = env("LEONIDA_DS_TRIGGER_FREQ"); !f.empty())
         c.ds_trigger_frequency = static_cast<uint8_t>(std::clamp(std::atoi(f.c_str()), 1, 255));
     if (const std::string l = env("LEONIDA_DS_LIGHTBAR"); !l.empty()) {
@@ -1689,6 +1691,33 @@ constexpr rt::gameinput::KeyBinding kKeyBindings[] = {
     {VK_TAB, SDL_GAMEPAD_BUTTON_BACK, "Tab"},
 };
 
+// Opt-in GTA V PC-style bindings (LEONIDA_KBM_GTA=1, Belobug/VIctory-Belobug-AMD PR #295).
+constexpr rt::gameinput::KeyBinding kGtaKeyBindings[] = {
+    {VK_UP, SDL_GAMEPAD_BUTTON_DPAD_UP, "Up"},
+    {VK_DOWN, SDL_GAMEPAD_BUTTON_DPAD_DOWN, "Down"},
+    {VK_LEFT, SDL_GAMEPAD_BUTTON_DPAD_LEFT, "Left"},
+    {VK_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "Right"},
+    {'E', SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "E"},
+    {VK_RETURN, SDL_GAMEPAD_BUTTON_SOUTH, "Enter"},
+    {VK_LSHIFT, SDL_GAMEPAD_BUTTON_SOUTH, "LShift"},
+    {VK_RSHIFT, SDL_GAMEPAD_BUTTON_SOUTH, "RShift"},
+    {VK_BACK, SDL_GAMEPAD_BUTTON_EAST, "Backspace"},
+    {'R', SDL_GAMEPAD_BUTTON_EAST, "R"},
+    {'X', SDL_GAMEPAD_BUTTON_WEST, "X"},
+    {VK_SPACE, SDL_GAMEPAD_BUTTON_WEST, "Space"},
+    {'Y', SDL_GAMEPAD_BUTTON_NORTH, "Y"},
+    {'F', SDL_GAMEPAD_BUTTON_NORTH, "F"},
+    {VK_TAB, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "Tab"},
+    {'Q', SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "Q"},
+    {VK_LCONTROL, SDL_GAMEPAD_BUTTON_LEFT_STICK, "LCtrl"},
+    {VK_RCONTROL, SDL_GAMEPAD_BUTTON_LEFT_STICK, "RCtrl"},
+    {VK_MBUTTON, SDL_GAMEPAD_BUTTON_RIGHT_STICK, "MMB"},
+    {'C', SDL_GAMEPAD_BUTTON_RIGHT_STICK, "C"},
+    {VK_ESCAPE, SDL_GAMEPAD_BUTTON_START, "Esc"},
+    {'P', SDL_GAMEPAD_BUTTON_START, "P"},
+    {'V', SDL_GAMEPAD_BUTTON_BACK, "V"},
+};
+
 // WASD on the left stick: a full press is the edge of the stick; a diagonal sits on the round gate, as a real stick
 // reports it, so each axis is 1/sqrt(2) of full.
 constexpr int kStickFull = 32767;
@@ -1859,11 +1888,14 @@ struct KeyboardPadBackend {
 // Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
 void update_keyboard_pad() {
     float sens;
+    bool kbm_gta, invert_y;
     rt::gameinput::KeyboardPadMode mode;
     {
         std::lock_guard lock(g().mu);
         mode = g().config.keyboard_pad;
         sens = g().config.mouse_sensitivity;
+        kbm_gta = g().config.kbm_gta;
+        invert_y = g().config.mouse_invert_y;
     }
     KeyboardPadBackend backend;
     const bool enabled = mode != rt::gameinput::KeyboardPadMode::Off;
@@ -1877,12 +1909,22 @@ void update_keyboard_pad() {
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
     bool aim = false, fire = false;
+    static bool gta_mouse_locked = true;
+    static bool toggle_was_down = false;
     // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
     // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
     if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
-        for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+        if (kbm_gta) {
+            for (const auto& b : kGtaKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+            const bool toggle_down = key_down(VK_F2) || key_down(VK_OEM_3);
+            if (toggle_down && !toggle_was_down) gta_mouse_locked = !gta_mouse_locked;
+            toggle_was_down = toggle_down;
+            if (key_down(VK_ESCAPE) || key_down('P')) gta_mouse_locked = false;
+        } else {
+            for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+        }
         lx = key_down('D') - key_down('A');  // opposite keys cancel
         ly = key_down('S') - key_down('W');  // SDL's +Y is down
         aim = key_down(VK_RBUTTON);
@@ -1890,22 +1932,32 @@ void update_keyboard_pad() {
 
         int x = 0, y = 0;
         const bool have = g_cursor_pos.load()(&x, &y);
-        const bool moved = have && g_keyboard.have_cursor;
+        const bool moved = have && g_keyboard.have_cursor && (!kbm_gta || gta_mouse_locked);
         auto step = [sens](int v, int pixels) {
             const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
                                 std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
             return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
         };
         g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
-        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+        g_keyboard.right_y = step(g_keyboard.right_y, moved ? (invert_y ? -(y - g_keyboard.cursor_y) : (y - g_keyboard.cursor_y)) : 0);
+        if (kbm_gta && !gta_mouse_locked) {
+            const int rx = key_down('L') - key_down('J');
+            const int ry = key_down('K') - key_down('I');
+            if (rx) g_keyboard.right_x = rx * kStickFull;
+            if (ry) g_keyboard.right_y = ry * kStickFull;
+        }
         if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
         g_keyboard.have_cursor = have;
     } else {
+        toggle_was_down = false;
+        if (kbm_gta) gta_mouse_locked = false;
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
     }
-    clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
-    for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
+    clip_cursor(active && (!kbm_gta || gta_mouse_locked) && g_raw_ready &&
+                g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
+    for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i)
+        SDL_SetJoystickVirtualButton(g_keyboard.js, static_cast<SDL_GamepadButton>(i), down[i]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
     // pad, in seconds since the pad's first update, each held 300 ms or its own button@seconds:hold, and then until the
     // title has read the pads kReads times since it began (never past kMaxHold seconds, or the hold if it is longer, so
