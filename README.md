@@ -47,7 +47,7 @@ Instead of emulating the entire Xbox Series console, `gta2pc` translates the gam
 **Requirements:** Windows 10/11 (x64) or 64-bit Linux (Wine/Proton) • Vulkan 1.3 GPU • ~400 GB free disk space • Unpacked Xbox Series `1.0.2.1` directory (`MicrosoftGame.Config` + `.rpf` files).
 
 ```bash
-git clone --recursive [https://github.com/BasGame1/gta2pc.git](https://github.com/BasGame1/gta2pc.git)
+git clone --recursive https://github.com/BasGame1/gta6pc.git
 cd gta2pc
 ```
 
@@ -68,6 +68,9 @@ cd gta2pc
 
 ### Mirrors & Community
 
-- **GitHub:** https://github.com/BasGame1/gta2pc
+- **GitHub:** https://github.com/BasGame1/gta6pc
 - **GitLab:** https://gitlab.com/BasGame1/gta2pc
 - **Telegram:** https://t.me/PixelifyNext
+
+> [!NOTE]
+> The prs/ folder was used as a way to record the prs related to the project, does not have any practical use now. Ignore it 
