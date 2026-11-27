@@ -555,6 +555,10 @@ int submit_write(WriteBack& s, std::initializer_list<UINT64> addresses, UINT bas
     return 0;
 }
 
+int submit_write(WriteBack& s, UINT64 address, UINT base = 0, UINT step = 1) {
+    return submit_write(s, {address}, base, step);
+}
+
 // The same gap on a buffer the title places at its own address (slot 133, the retail case for a compute result it
 // reads back): the pages are not imported here, so the buffer is a shadow, and the write of a root UAV over the
 // title's VA must reach the pages at the next submission - and the title's own newer words must still win.
