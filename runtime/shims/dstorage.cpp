@@ -1241,14 +1241,15 @@ private:
 
     // The caller may populate or remap the physical page list between enqueue and Submit.
     // Snapshot page numbers on the worker before taking xmem's allocation/map lock.
-    static HRESULT page_transfer(const ULONG_PTR* pages, uint16_t offset, std::span<uint8_t> buffer, bool write) {
+    static HRESULT page_transfer(const ULONG_PTR* pages, uint16_t offset, std::span<uint8_t> buffer, bool write,
+                                 bool count_page0 = true) {
         if (buffer.empty()) return S_OK;
         std::vector<uint64_t> numbers(1 + (buffer.size() - 1 + offset) / 65536);
         if (!guarded_move(numbers.data(), pages, numbers.size() * sizeof(numbers[0])))
             return E_DSTORAGE_ACCESS_VIOLATION;
         // Page 0 is never a title page: a destination list that names it was not filled when its request ran, and
         // the request fails below. Counted, since each one is data the title asked for and did not get.
-        if (write && std::find(numbers.begin(), numbers.end(), uint64_t{0}) != numbers.end())
+        if (write && count_page0 && std::find(numbers.begin(), numbers.end(), uint64_t{0}) != numbers.end())
             log_hold("page0", ++leonida::dstorage::hold_stats().page0_entries, 0, 0);
         if (rt::xmem::transfer_physical(numbers, offset, buffer, write)) return S_OK;
         return HRESULT_FROM_WIN32(GetLastError());
@@ -1389,7 +1390,8 @@ private:
             const unsigned max_tries = retries_on ? 4u : 1u;
             for (unsigned tries = 0; tries < max_tries; ++tries) {
                 if (tries > 0) Sleep(1u << (tries - 1));
-                hr = page_transfer(r.DestinationPageArray, r.DestinationPageOffset, data, true);
+                hr = page_transfer(r.DestinationPageArray, r.DestinationPageOffset, data, true,
+                                   tries + 1 == max_tries);
                 if (SUCCEEDED(hr) || hr == E_DSTORAGE_ACCESS_VIOLATION) break;
             }
         } else if (!data.empty()) {
