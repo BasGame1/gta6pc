@@ -15706,7 +15706,8 @@ public:
             // next pass unprobed and unhashed; hashing it now would only find it changed again (measured: 10,000
             // deferred textures, 600 MiB hashed a pass, during the story load).
             const auto out_of_budget = [&] {
-                return (filled && filled + span > fill_budget) || (fill_budget_ns && fill_pass_ns >= fill_budget_ns);
+                return ticks < title_upload_backoff_until_.load(std::memory_order_relaxed) ||
+                       (filled && filled + span > fill_budget) || (fill_budget_ns && fill_pass_ns >= fill_budget_ns);
             };
             if (t.stale && !always && out_of_budget()) {
                 ++stats.deferred;
@@ -15947,6 +15948,7 @@ private:
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
     std::atomic<std::int64_t> title_refreshed_{0};                 // steady_clock ticks of the last pass
+    std::atomic<std::int64_t> title_upload_backoff_until_{0};      // steady_clock ticks after E_OUTOFMEMORY (Belobug residency)
     std::atomic<std::uint64_t> refreshed_present_{~std::uint64_t(0)};  // LEONIDA_REFRESH_PER_FRAME: present of the last full refresh
 
     // LEONIDA_TITLE_FILL_ASYNC=1 (for runs that only need the title to go on): slot-70 views no longer fill or hash
@@ -16585,6 +16587,13 @@ private:
         if (!ok) {
             ++title_stats_.fill_failures;
             t.stale = true;
+            // Back off speculative uploads for 500 ms and release staging on failure (Belobug/VIctory-Belobug-AMD residency.rs).
+            const auto until = (std::chrono::steady_clock::now() + std::chrono::milliseconds(500))
+                                   .time_since_epoch()
+                                   .count();
+            title_upload_backoff_until_.store(until, std::memory_order_relaxed);
+            std::lock_guard u(state_.title_upload_mutex);
+            state_.title_upload.release(state_);
             return 0;
         }
         if (trace_pool)
