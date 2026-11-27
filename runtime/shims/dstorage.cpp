@@ -533,12 +533,26 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
         if (!read()) {
             const DWORD error = GetLastError();
             if (error != ERROR_NOACCESS) return read_error(error);
-            // Destination pages not committed yet (see touch_pages): commit them from user mode and read again once.
-            touch_pages(out + done, size - done);
-            at = OVERLAPPED{};
-            at.Offset = static_cast<DWORD>(position);
-            at.OffsetHigh = static_cast<DWORD>(position >> 32);
-            if (!read()) return read_error(GetLastError());
+            // Destination pages not committed yet (see touch_pages), or guarded again between open and ReadFile
+            // (Belobug/VIctory-Belobug-AMD dstorage.rs READ_RETRIES=8): touch/reopen and retry committed pages.
+            MEMORY_BASIC_INFORMATION m{};
+            const bool committed = VirtualQuery(out + done, &m, sizeof(m)) == sizeof(m) && m.State == MEM_COMMIT;
+            const unsigned max_tries = committed ? 8u : 1u;
+            DWORD last_error = error;
+            for (unsigned tries = 0; tries < max_tries; ++tries) {
+                if (tries > 0) Sleep(1u << (tries - 1));
+                touch_pages(out + done, size - done);
+                at = OVERLAPPED{};
+                at.Offset = static_cast<DWORD>(position);
+                at.OffsetHigh = static_cast<DWORD>(position >> 32);
+                if (read()) {
+                    last_error = ERROR_SUCCESS;
+                    break;
+                }
+                last_error = GetLastError();
+                if (last_error != ERROR_NOACCESS) return read_error(last_error);
+            }
+            if (last_error != ERROR_SUCCESS) return read_error(last_error);
         }
         if (got == 0) return E_DSTORAGE_END_OF_FILE;  // the file shrank since the size check
         done += got;
@@ -1367,8 +1381,18 @@ private:
         const auto bc = options::bcpack(o), sw = options::swizzle(o);
         HRESULT hr = S_OK;
         const auto copy_begin = Timing::start();
-        if (o & options::kDestinationPages) hr = page_transfer(r.DestinationPageArray, r.DestinationPageOffset, data, true);
-        else if (!data.empty()) {
+        if (o & options::kDestinationPages) {
+            static const bool retries_on = [] {
+                char value[2]{};
+                return GetEnvironmentVariableA("LEONIDA_DSTORAGE_RETRIES", value, sizeof(value)) != 1 || value[0] != '0';
+            }();
+            const unsigned max_tries = retries_on ? 4u : 1u;
+            for (unsigned tries = 0; tries < max_tries; ++tries) {
+                if (tries > 0) Sleep(1u << (tries - 1));
+                hr = page_transfer(r.DestinationPageArray, r.DestinationPageOffset, data, true);
+                if (SUCCEEDED(hr) || hr == E_DSTORAGE_ACCESS_VIOLATION) break;
+            }
+        } else if (!data.empty()) {
             void* const dest = cpu_destination(r);
             if (extended_enabled() && !rt::xmem::commit_physical_range(dest, data.size())) {
                 e.reason = "destination-commit";
