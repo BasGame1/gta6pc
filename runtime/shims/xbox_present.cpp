@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -128,6 +129,36 @@ float XboxPresentation::effective_sdr_white_nits() {
 }
 
 HRESULT XboxPresentation::SetFrameIntervalX(IUnknown*, UINT interval_period_us, UINT latency, UINT flags) {
+    // LEONIDA_FRAME_INTERVAL_MS=<ms> (0..1000, Belobug/VIctory-Belobug-AMD frame.rs): override the title's
+    // interval (e.g. 16.667 for 60 Hz, 0 for uncapped); unset keeps the title's value.
+    if (interval_period_us != 0) {
+        static const struct Override {
+            bool set = false, uncap = false;
+            UINT us = 0;
+        } ov = []() {
+            Override o{};
+            char* val = nullptr;
+            std::size_t len = 0;
+            if (_dupenv_s(&val, &len, "LEONIDA_FRAME_INTERVAL_MS") == 0 && val) {
+                if (*val != '\0') {
+                    char* end = nullptr;
+                    const double ms = std::strtod(val, &end);
+                    while (end && (*end == ' ' || *end == '\t')) ++end;
+                    if (end != val && (!end || *end == '\0') && std::isfinite(ms) && ms >= 0.0 && ms <= 1000.0) {
+                        o.set = true;
+                        o.uncap = ms == 0.0;
+                        o.us = o.uncap ? 0 : (std::max)(1u, static_cast<UINT>(std::llround(ms * 1000.0)));
+                    }
+                }
+                std::free(val);
+            }
+            return o;
+        }();
+        if (ov.set) {
+            if (ov.uncap) pacer_.set_uncapped(true);
+            else interval_period_us = ov.us;
+        }
+    }
     return from_pacer(pacer_.set_frame_interval(interval_period_us, latency, flags));
 }
 
